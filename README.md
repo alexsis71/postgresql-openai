@@ -1,0 +1,69 @@
+# PostgreSQL OpenAI
+
+Пет-проект для разработки SQL-функций по текстовому описанию. PostgreSQL собирает каталог своей схемы, LLM составляет обзор базы для разработчика, а будущая `make_func` будет выводить сигнатуру и тело обычной SQL-функции по заданию и каталогу.
+
+## Что уже работает
+
+`ai.init_catalog()` сканирует выбранные схемы текущей базы, при необходимости добавляет небольшие выборки из указанных столбцов и вызывает OpenAI-совместимую модель. Результат сохраняется в `ai.catalog_snapshot`. Из него можно читать метаданные и обзор обычным SQL без повторного вызова модели.
+
+Проверено на `dvd_rent` в локальном Docker с PostgreSQL 17.10 и `qwen3.8-flash-next` на DGX. Снимок № 2 содержит 22 таблицы и представления, 10 функций и агрегатов и 2 пользовательских типа. Прогон с выборками занял около 56 секунд. [Сохранённый обзор модели](dvd_rent-synopsis.md)
+
+## Файлы проекта
+
+| Файл | Назначение |
+| --- | --- |
+| [docs/design.md](docs/design.md) | Исходная постановка, цели, архитектура и план `make_func` |
+| [sql/install_catalog.sql](sql/install_catalog.sql) | Установка схем, таблиц и `ai.init_catalog()` |
+| [sql/init_dvd_rent.sql](sql/init_dvd_rent.sql) | Профиль Flash Next и создание снимка демо-базы |
+| [examples/inspect_catalog.sql](examples/inspect_catalog.sql) | Чтение последнего снимка, типов и связей таблицы платежей |
+| [examples/customer_revenue_baseline.sql](examples/customer_revenue_baseline.sql) | Эталонный запрос для проверки будущей `make_func` |
+| [dvdrental.tar](dvdrental.tar) | Исходный архив демо-базы для `pg_restore` |
+
+## Запуск в локальном Docker
+
+Команды ниже рассчитаны на PowerShell, контейнер `postgres1` и базу `dvd_rent`. Для PostgreSQL 17 серверу нужен пакет `postgresql-17-http`. Если он уже установлен, сразу переходите к SQL-скриптам.
+
+В Debian-образе с настроенным репозиторием PGDG сначала проверьте план установки пакета. В текущем контейнере эта установка добавила `pgsql-http` и его зависимости без обновления PostgreSQL.
+
+```powershell
+docker exec postgres1 apt-get -s install --no-install-recommends --no-upgrade postgresql-17-http
+docker exec postgres1 apt-get -y install --no-install-recommends --no-upgrade postgresql-17-http
+```
+
+Если демо-базы ещё нет, восстановите архив в новую пустую базу.
+
+```powershell
+docker cp .\dvdrental.tar postgres1:/tmp/dvdrental.tar
+docker exec postgres1 sh -c 'createdb -U "${POSTGRES_USER:-postgres}" dvd_rent && pg_restore --exit-on-error --no-owner --no-privileges -U "${POSTGRES_USER:-postgres}" -d dvd_rent /tmp/dvdrental.tar'
+```
+
+Запустите скрипты под владельцем установки. Первый создаёт объекты в `dvd_rent`. Второй использует профиль `default` и при каждом успешном запуске создаёт новый снимок. Если профиль с этим именем уже есть, скрипт использует его настройки.
+
+```powershell
+Get-Content -Raw .\sql\install_catalog.sql | docker exec -i postgres1 sh -c 'psql -X -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d dvd_rent'
+Get-Content -Raw .\sql\init_dvd_rent.sql | docker exec -i postgres1 sh -c 'psql -X -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d dvd_rent'
+Get-Content -Raw .\examples\inspect_catalog.sql | docker exec -i postgres1 sh -c 'psql -X -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d dvd_rent'
+```
+
+Демо-профиль обращается к `http://10.8.0.10:8002/v1/chat/completions` напрямую из PostgreSQL. Внутренний endpoint DGX принимает запросы без ключа. Если PostgreSQL работает в Docker, сетевую доступность проверяют из контейнера. Для другого OpenAI-совместимого endpoint укажите адрес и модель в `ai.model_profile`. Авторизация внешних провайдеров пока в плане.
+
+### SQL-интерфейс
+
+```sql
+-- Scan public, with metadata only.
+SELECT ai.init_catalog();
+
+-- Add a small sample from a reference table.
+SELECT ai.init_catalog(
+    p_schemas => ARRAY['public'],
+    p_samples => '{"public.category": ["category_id", "name"]}',
+    p_sample_rows => 3,
+    p_profile => 'default'
+);
+
+-- Read the latest saved synopsis without contacting the model.
+SELECT id, model, synopsis
+FROM ai.catalog_snapshot
+ORDER BY id DESC
+LIMIT 1;
+```
