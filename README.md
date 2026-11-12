@@ -1,6 +1,6 @@
 # PostgreSQL OpenAI
 
-Пет-проект для разработки SQL-функций по текстовому описанию. PostgreSQL собирает каталог своей схемы, LLM составляет обзор базы для разработчика, а будущая `make_func` будет выводить сигнатуру и тело обычной SQL-функции по заданию и каталогу.
+Пет-проект для разработки SQL-функций по текстовому описанию. PostgreSQL собирает каталог своей схемы, LLM составляет обзор базы для разработчика, а `make_func` выводит сигнатуру и тело обычной SQL-функции по заданию и каталогу.
 
 ## Что уже работает
 
@@ -12,11 +12,12 @@
 
 | Файл | Назначение |
 | --- | --- |
-| [docs/design.md](docs/design.md) | Исходная постановка, цели, архитектура и план `make_func` |
+| [docs/design.md](docs/design.md) | Исходная постановка, устройство каталога и алгоритм `make_func` |
 | [sql/install_catalog.sql](sql/install_catalog.sql) | Установка и миграция каталога и `ai.init_catalog()` |
 | [sql/init_dvd_rent.sql](sql/init_dvd_rent.sql) | Профиль Flash Next и обновление каталога демо-базы |
 | [examples/inspect_catalog.sql](examples/inspect_catalog.sql) | Чтение каталога `public`, типов и связей таблицы платежей |
-| [examples/customer_revenue_baseline.sql](examples/customer_revenue_baseline.sql) | Эталонный запрос для проверки будущей `make_func` |
+| [examples/make_func_customer_revenue.sql](examples/make_func_customer_revenue.sql) | Создание функции суммы платежей в схеме `reporting` |
+| [examples/customer_revenue_baseline.sql](examples/customer_revenue_baseline.sql) | Эталонный запрос для проверки созданной функции |
 | [dvdrental.tar](dvdrental.tar) | Исходный архив демо-базы для `pg_restore` |
 
 ## Запуск в локальном Docker
@@ -66,3 +67,25 @@ SELECT id, model, synopsis
 FROM ai.catalog_snapshot
 WHERE schema_name = 'public';
 ```
+
+### Генерация функции
+
+```sql
+CREATE SCHEMA IF NOT EXISTS reporting;
+
+SELECT * FROM ai.make_func(
+    'reporting.customer_revenue',
+    'По клиенту и периоду вернуть сумму платежей.
+     Начало включительно, конец исключительно. При отсутствии платежей вернуть ноль.'
+);
+```
+
+Вызов использует профиль `default` и сохранённый каталог. Он создаёт функцию в указанной схеме и возвращает её `signature`, выполненный `ddl` и `assumptions`. Вызывающему нужно право `CREATE` на целевую схему. Если функция с такой сигнатурой уже существует, PostgreSQL возвращает ошибку.
+
+```sql
+SELECT reporting.customer_revenue(
+    1::smallint, timestamp '2007-02-01', timestamp '2007-06-01'
+);
+```
+
+Результат можно сравнить с [эталоном](examples/customer_revenue_baseline.sql).
