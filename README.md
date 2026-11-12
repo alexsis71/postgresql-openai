@@ -8,15 +8,18 @@
 
 Демо использует `dvd_rent` в локальном Docker с PostgreSQL 17.10 и `qwen3.8-flash-next` на DGX. Каталог `public` содержит 22 таблицы и представления, 10 функций и агрегатов и 2 пользовательских типа. [Пример обзора модели](dvd_rent-synopsis.md)
 
+Кроме подготовки SQL, из базы можно говорить с моделью напрямую: `SELECT * FROM llm(<system prompt>, <user_prompt>)` возвращает ответ вместе с моделью, расходом токенов и временем запроса. Подробно — в разделе «Чат с моделью».
+
 ## Файлы проекта
 
 | Файл | Назначение |
 | --- | --- |
 | [docs/design.md](docs/design.md) | Исходная постановка, устройство каталога и алгоритм `make_func` |
-| [sql/install_catalog.sql](sql/install_catalog.sql) | Установка и миграция каталога и `ai.init_catalog()` |
+| [sql/install_catalog.sql](sql/install_catalog.sql) | Установка и миграция каталога, `ai.init_catalog()`, `ai.make_func()` и `llm()` |
 | [sql/init_dvd_rent.sql](sql/init_dvd_rent.sql) | Профиль Flash Next и обновление каталога демо-базы |
 | [examples/inspect_catalog.sql](examples/inspect_catalog.sql) | Чтение каталога `public`, типов и связей таблицы платежей |
 | [examples/make_func_customer_revenue.sql](examples/make_func_customer_revenue.sql) | Создание функции суммы платежей в схеме `reporting` |
+| [examples/llm_chat.sql](examples/llm_chat.sql) | Чат с моделью: одиночный вопрос, история разговора, вопрос про каталог |
 | [examples/customer_revenue_baseline.sql](examples/customer_revenue_baseline.sql) | Эталонный запрос для проверки созданной функции |
 | [dvdrental.tar](dvdrental.tar) | Исходный архив демо-базы для `pg_restore` |
 
@@ -91,3 +94,59 @@ SELECT reporting.customer_revenue(
 ```
 
 Результат можно сравнить с [эталоном](examples/customer_revenue_baseline.sql).
+
+## Чат с моделью
+
+`llm(<system prompt>, <user_prompt>)` — общий доступ к модели из SQL. Вызов не зависит от
+каталога: в профиль уходят два сообщения, `system` и `user`, обратно — таблица с одной строкой.
+
+```sql
+SELECT * FROM llm(
+    'Отвечай на русском одним коротким предложением без предисловий.',
+    'Что делает команда VACUUM в PostgreSQL?'
+);
+```
+
+| Столбец | Содержание |
+| --- | --- |
+| `answer` | Текст ответа модели |
+| `model`, `profile` | Модель из ответа и имя использованного профиля |
+| `finish_reason` | `stop`; неполный ответ прерывается ошибкой |
+| `prompt_tokens`, `completion_tokens`, `total_tokens` | Расход токенов из ответа провайдера |
+| `latency_ms` | Время запроса, измеренное в PostgreSQL |
+
+Нужен только текст ответа — `SELECT answer FROM llm(...)`.
+
+Многоходовость собирает вызывающая сторона: история разговора — массив сообщений `user` и
+`assistant`, который вставляется между системным промптом и новым вопросом.
+
+```sql
+SELECT answer FROM llm(
+    'Отвечай на русском кратко.',
+    'А чем отличается от VACUUM FULL?',
+    p_history => '[
+        {"role": "user", "content": "Что делает VACUUM в PostgreSQL?"},
+        {"role": "assistant", "content": "Освобождает место под удалённые кортежи без блокировки таблиц."}
+    ]'::jsonb
+);
+```
+
+Системный промпт допустим `NULL` — тогда уходит только пользовательское сообщение. Третий
+аргумент `p_profile` выбирает профиль из `ai.model_profile`. Пустой пользовательский промпт,
+неизвестный профиль и неверная структура истории поднимают `RAISE EXCEPTION`; размер диалога
+ограничен `max_context_length` выбранного профиля (в байтах сериализованного JSON), длина
+ответа — параметром `max_tokens` того же профиля. Новый профиль с другим лимитом заводится
+строкой в `ai.model_profile`, код функции править не нужно.
+
+Функция определена как `ai.llm` и как `public.llm` с одинаковыми аргументами, поэтому работают
+и `SELECT * FROM ai.llm(...)`, и вызов без имени схемы. Обе, как и остальные функции `ai`,
+закрыты от `PUBLIC`; доступ рабочей роли выдаётся явно:
+
+```sql
+GRANT USAGE ON SCHEMA ai TO app_user;
+GRANT EXECUTE ON FUNCTION ai.llm(text, text, text, jsonb) TO app_user;
+GRANT EXECUTE ON FUNCTION public.llm(text, text, text, jsonb) TO app_user;
+```
+
+Каждый вызов `llm` — обращение к модели, а не обычный `SELECT`. Готовые запросы — в
+[examples/llm_chat.sql](examples/llm_chat.sql).

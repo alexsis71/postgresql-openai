@@ -174,6 +174,9 @@ SELECT id, model, synopsis
 FROM ai.catalog_snapshot
 ORDER BY id DESC
 LIMIT 1;
+
+-- Спросить модель напрямую, без каталога.
+SELECT * FROM llm('Отвечай на русском кратко.', 'Что делает VACUUM?');
 ```
 
 ### `ai.init_catalog(p_schemas, p_samples, p_sample_rows, p_profile) RETURNS bigint`
@@ -200,18 +203,30 @@ LIMIT 1;
 - Сырые строки выборок уходят в запрос к модели, но в снимке не сохраняются — остаётся только `sample_manifest` (таблицы, столбцы, число строк).
 - Определение представления читается `pg_get_viewdef`, сигнатуры функций — `pg_get_function_identity_arguments` / `pg_get_function_result`; в каталог попадают только валидные индексы (`indisvalid`) и внутренние невключённые триггеры (`NOT tgisinternal AND tgenabled <> 'D'`).
 
+### `llm(p_system, p_user, p_profile, p_history) RETURNS TABLE (answer, model, profile, finish_reason, prompt_tokens, completion_tokens, total_tokens, latency_ms)`
+
+Общий чат с моделью из SQL: `SELECT * FROM llm(<system prompt>, <user_prompt>)`. Каталог не участвует, профиль по умолчанию — `default`.
+
+- Реализация — `ai.llm` (PL/pgSQL) и обёртка `public.llm` (`LANGUAGE sql`, `SECURITY INVOKER`) с теми же аргументами, чтобы работал и вызов без имени схемы. Правка сигнатуры требует `DROP FUNCTION IF EXISTS` для **обеих** — `CREATE OR REPLACE` не меняет список выходных столбцов.
+- HTTP и проверка ответа целиком в `ai._complete`; `llm` только собирает `messages` и разбирает `choices[0]` и `usage`. Ответ с `finish_reason` ≠ `stop` — ошибка, а не обрезанный `answer`; длина ответа ограничена `max_tokens` профиля.
+- `p_system` допускается `NULL` (уходит одно сообщение `user`), `p_history` — массив объектов `{"role": "user|assistant", "content": ...}` между системным промптом и новым вопросом; историю хранит вызывающая сторона, в БД диалоги не пишутся.
+- Валидация на входе (`RAISE EXCEPTION`): пустой `p_user`, неизвестный профиль, `p_history` не массив, роль вне `user`/`assistant`, пустое `content`, контекст больше `max_context_length` профиля. Профиль читается **до** сборки сообщений — иначе лимит брать неоткуда, поэтому ошибка неизвестного профиля опережает ошибку истории.
+- Промпт уходит только в тело HTTP-запроса: динамического SQL в `llm` нет, поэтому содержимое промпта не может стать выполнимым SQL. Ответ модели в функции тоже не исполняется.
+- Важно: у выходного столбца есть имя `profile`, поэтому запрос профиля обязан быть с квалификатором — `WHERE mp.profile = p_profile`. Без алиаса PL/pgSQL подставил бы в `WHERE` выходной параметр вместо столбца таблицы.
+- Обе функции отозваны у `PUBLIC`; рабочей роли нужны `USAGE` на схему `ai` и `EXECUTE` на обе функции.
+
 ### Служебные объекты
 
 | Объект | Содержимое |
 | --- | --- |
-| `ai.model_profile` | Профили моделей: `profile`, `endpoint` (CHECK на `http(s)://`), `model`, `max_tokens` (1–16000, по умолчанию 4000), `timeout_ms` (1000–180000, по умолчанию 90000), `request_options` (jsonb-объект) |
+| `ai.model_profile` | Профили моделей: `profile`, `endpoint` (CHECK на `http(s)://`), `model`, `max_tokens` (1–16000, по умолчанию 4000), `timeout_ms` (1000–180000, по умолчанию 90000), `max_context_length` (1000–10000000 **байт**, по умолчанию 250000), `request_options` (jsonb-объект) |
 | `ai.catalog_snapshot.metadata` | JSON-каталог фактов из PostgreSQL: массивы `relations`, `routines`, `types` — читаются и фильтруются из SQL |
 | `ai.catalog_snapshot.sample_manifest` | Состав выборок: столбцы и число прочитанных строк |
 | `ai.catalog_snapshot.synopsis` | Markdown-обзор модели; утверждения о типах и ограничениях сверять с `metadata`, а не с текстом |
 
-Профиль `default` из `sql/init_dvd_rent.sql`: `http://10.8.0.10:8002/v1/chat/completions`, модель `qwen3.8-flash-next`, `{"temperature": 0, "chat_template_kwargs": {"enable_thinking": false}}`. Для другой модели или провайдера достаточно новой строки в `ai.model_profile` — код функции править не нужно.
+Профиль `default` из `sql/init_dvd_rent.sql`: `http://10.8.0.10:8002/v1/chat/completions`, модель `qwen3.8-flash-next`, `max_context_length = 250000`, `{"temperature": 0, "chat_template_kwargs": {"enable_thinking": false}}`. Для другой модели или провайдера достаточно новой строки в `ai.model_profile` — код функции править не нужно.
 
-`max_model_len` модели (262144) и лимит функции (250 000 байт) измеряются в разных единицах, сопоставлять их напрямую некорректно.
+`max_model_len` модели (262144) и `max_context_length` измеряются в разных единицах — первые в токенах, вторая в байтах сериализованного JSON, сопоставлять их напрямую некорректно. Лимит из профиля читает только `llm`; `init_catalog` и `make_func` до сих пор сравнивают контекст с хардкодом 250000 байт.
 
 ## Соглашения разработки
 

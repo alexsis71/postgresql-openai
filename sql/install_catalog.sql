@@ -12,8 +12,14 @@ CREATE TABLE IF NOT EXISTS ai.model_profile (
     model text NOT NULL,
     max_tokens integer NOT NULL DEFAULT 4000 CHECK (max_tokens BETWEEN 1 AND 16000),
     timeout_ms integer NOT NULL DEFAULT 90000 CHECK (timeout_ms BETWEEN 1000 AND 180000),
+    max_context_length integer NOT NULL DEFAULT 250000
+        CHECK (max_context_length BETWEEN 1000 AND 10000000),
     request_options jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(request_options) = 'object')
 );
+
+ALTER TABLE ai.model_profile
+    ADD COLUMN IF NOT EXISTS max_context_length integer NOT NULL DEFAULT 250000
+        CHECK (max_context_length BETWEEN 1000 AND 10000000);
 
 CREATE TABLE IF NOT EXISTS ai.catalog_snapshot (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -535,7 +541,105 @@ $prompt$),
 END;
 $function$;
 
+DROP FUNCTION IF EXISTS ai.llm(text, text, text, jsonb);
+
+CREATE OR REPLACE FUNCTION ai.llm(
+    p_system text,
+    p_user text,
+    p_profile text DEFAULT 'default',
+    p_history jsonb DEFAULT '[]'::jsonb
+) RETURNS TABLE (
+    answer text,
+    model text,
+    profile text,
+    finish_reason text,
+    prompt_tokens integer,
+    completion_tokens integer,
+    total_tokens integer,
+    latency_ms integer
+)
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_profile ai.model_profile%ROWTYPE;
+    v_messages jsonb := '[]'::jsonb;
+    v_payload jsonb;
+    v_started timestamptz := clock_timestamp();
+BEGIN
+    IF nullif(btrim(coalesce(p_user, '')), '') IS NULL THEN
+        RAISE EXCEPTION 'Provide a user prompt';
+    END IF;
+
+    SELECT * INTO v_profile FROM ai.model_profile AS mp WHERE mp.profile = p_profile;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Unknown model profile: %', p_profile;
+    END IF;
+
+    IF nullif(btrim(coalesce(p_system, '')), '') IS NOT NULL THEN
+        v_messages := v_messages || jsonb_build_array(
+            jsonb_build_object('role', 'system', 'content', p_system)
+        );
+    END IF;
+    IF jsonb_typeof(p_history) IS DISTINCT FROM 'array' THEN
+        RAISE EXCEPTION 'p_history must be an array of role and content objects';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM jsonb_array_elements(p_history) AS item(message)
+        WHERE jsonb_typeof(item.message) <> 'object'
+           OR NOT (item.message->>'role' = ANY (ARRAY['user', 'assistant']))
+           OR nullif(btrim(coalesce(item.message->>'content', '')), '') IS NULL
+    ) THEN
+        RAISE EXCEPTION 'Each history item needs a user or assistant role and non-empty content';
+    END IF;
+    v_messages := v_messages || p_history
+        || jsonb_build_array(jsonb_build_object('role', 'user', 'content', p_user));
+    IF octet_length(v_messages::text) > v_profile.max_context_length THEN
+        RAISE EXCEPTION 'Chat context of % bytes exceeds max_context_length % of profile %',
+            octet_length(v_messages::text), v_profile.max_context_length, v_profile.profile;
+    END IF;
+
+    v_payload := ai._complete(v_profile, v_messages);
+    answer := v_payload #>> '{choices,0,message,content}';
+    model := coalesce(v_payload->>'model', v_profile.model);
+    profile := v_profile.profile;
+    finish_reason := v_payload #>> '{choices,0,finish_reason}';
+    prompt_tokens := (v_payload #> '{usage,prompt_tokens}')::integer;
+    completion_tokens := (v_payload #> '{usage,completion_tokens}')::integer;
+    total_tokens := (v_payload #> '{usage,total_tokens}')::integer;
+    latency_ms := floor(extract(epoch from clock_timestamp() - v_started) * 1000)::integer;
+    RETURN NEXT;
+END;
+$function$;
+
+DROP FUNCTION IF EXISTS public.llm(text, text, text, jsonb);
+
+CREATE OR REPLACE FUNCTION public.llm(
+    p_system text,
+    p_user text,
+    p_profile text DEFAULT 'default',
+    p_history jsonb DEFAULT '[]'::jsonb
+) RETURNS TABLE (
+    answer text,
+    model text,
+    profile text,
+    finish_reason text,
+    prompt_tokens integer,
+    completion_tokens integer,
+    total_tokens integer,
+    latency_ms integer
+)
+LANGUAGE sql
+SECURITY INVOKER
+SET search_path = pg_catalog
+AS $function$
+    SELECT * FROM ai.llm(p_system, p_user, p_profile, p_history) AS chat;
+$function$;
+
 REVOKE ALL ON FUNCTION ai._complete(ai.model_profile, jsonb) FROM PUBLIC;
 REVOKE ALL ON FUNCTION ai.init_catalog(text, jsonb, integer, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION ai.make_func(text, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION ai.llm(text, text, text, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.llm(text, text, text, jsonb) FROM PUBLIC;
 COMMIT;

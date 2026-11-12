@@ -1,11 +1,12 @@
 \set ON_ERROR_STOP on
 \timing on
 
-INSERT INTO ai.model_profile (profile, endpoint, model, request_options)
+INSERT INTO ai.model_profile (profile, endpoint, model, max_context_length, request_options)
 VALUES (
     'default',
     'http://10.8.0.10:8002/v1/chat/completions',
     'qwen3.8-flash-next',
+    250000,
     '{"temperature": 0, "chat_template_kwargs": {"enable_thinking": false}}'
 )
 ON CONFLICT (profile) DO NOTHING;
