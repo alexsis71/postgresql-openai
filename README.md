@@ -17,6 +17,7 @@
 | [docs/design.md](docs/design.md) | Исходная постановка, устройство каталога и алгоритм `make_func` |
 | [sql/install_catalog.sql](sql/install_catalog.sql) | Установка и миграция каталога, `ai.init_catalog()`, `ai.make_func()` и `llm()` |
 | [sql/init_dvd_rent.sql](sql/init_dvd_rent.sql) | Профиль Flash Next и обновление каталога демо-базы |
+| [sql/install_dvd_rent_skills.sql](sql/install_dvd_rent_skills.sql) | Навык расчёта выручки и его привязки к функциям демо-базы |
 | [examples/inspect_catalog.sql](examples/inspect_catalog.sql) | Чтение каталога `public`, типов и связей таблицы платежей |
 | [examples/make_func_customer_revenue.sql](examples/make_func_customer_revenue.sql) | Создание функции суммы платежей в схеме `reporting` |
 | [examples/llm_chat.sql](examples/llm_chat.sql) | Чат с моделью: одиночный вопрос, история разговора, вопрос про каталог |
@@ -121,8 +122,11 @@ SELECT reporting.customer_revenue(
 
 ## Чат с моделью
 
-`llm(<system prompt>, <user_prompt>)` — общий доступ к модели из SQL. Вызов не зависит от
-каталога: в профиль уходят два сообщения, `system` и `user`, обратно — таблица с одной строкой.
+`llm(<system prompt>, <user_prompt>)` — общий доступ к модели из SQL. Если новый вопрос
+содержит имя вида `схема.объект`, чат добавляет метаданные соответствующей схемы из
+`ai.catalog_snapshot`, когда снимок существует и доступен вызывающему. Например, вопрос
+про `public.country` получит снимок `public`, в котором видны и внешние ключи из других
+таблиц этой схемы. Для обычных вопросов каталог не добавляется.
 
 ```sql
 SELECT * FROM llm(
@@ -138,6 +142,7 @@ SELECT * FROM llm(
 | `finish_reason` | `stop`; неполный ответ прерывается ошибкой |
 | `prompt_tokens`, `completion_tokens`, `total_tokens` | Расход токенов из ответа провайдера |
 | `latency_ms` | Время запроса, измеренное в PostgreSQL |
+| `applied_skills` | Имена и версии навыков, переданных модели |
 
 Нужен только текст ответа — `SELECT answer FROM llm(...)`.
 
@@ -155,7 +160,7 @@ SELECT answer FROM llm(
 );
 ```
 
-Системный промпт допустим `NULL` — тогда вызов начинается с истории или пользовательского сообщения. Пустой пользовательский промпт, неизвестный профиль и неверная структура истории возвращают ошибку.
+Системный промпт допустим `NULL`. При наличии снимка чат добавляет инструкцию использовать его как источник сведений о базе. Пустой пользовательский промпт, неизвестный профиль и неверная структура истории возвращают ошибку.
 
 Функция определена как `ai.llm` и как `public.llm` с одинаковыми аргументами, поэтому работают
 и `SELECT * FROM ai.llm(...)`, и вызов без имени схемы. Обе, как и остальные функции `ai`,
@@ -163,9 +168,39 @@ SELECT answer FROM llm(
 
 ```sql
 GRANT USAGE ON SCHEMA ai TO app_user;
-GRANT EXECUTE ON FUNCTION ai.llm(text, text, text, jsonb) TO app_user;
-GRANT EXECUTE ON FUNCTION public.llm(text, text, text, jsonb) TO app_user;
+GRANT EXECUTE ON FUNCTION ai.llm(text, text, text, jsonb, text[]) TO app_user;
+GRANT EXECUTE ON FUNCTION public.llm(text, text, text, jsonb, text[]) TO app_user;
 ```
+
+Функции работают с правами вызывающего. При настройке роли отдельно учитывайте доступ к профилям, снимкам, навыкам и внутренним функциям. После обновления со старой сигнатуры проверьте явные права на `llm` и `make_func`.
 
 Каждый вызов `llm` — обращение к модели, а не обычный `SELECT`. Готовые запросы — в
 [examples/llm_chat.sql](examples/llm_chat.sql).
+
+## Навыки
+
+Установщик добавляет `use-snapshot@1`. Навык требует доступный снимок и передаёт его модели даже для вопроса без имени схемы. Если снимков нет или у роли отсутствует право чтения, вызов завершится ошибкой до обращения к модели.
+
+```sql
+SELECT answer, applied_skills
+FROM ai.llm(
+    'Отвечай кратко по-русски.',
+    'Какая таблица напрямую ссылается на country?',
+    p_skills => ARRAY['use-snapshot@1']
+);
+```
+
+Выполните [install_dvd_rent_skills.sql](sql/install_dvd_rent_skills.sql) в `dvd_rent`, чтобы добавить `rental-revenue@1` и привязать его к функциям расчёта выручки. Навыки хранятся отдельно от снимков и доступны по паре `name, version`.
+
+```sql
+SELECT * FROM ai.skill WHERE name = 'rental-revenue' AND version = 1;
+
+SELECT answer, applied_skills
+FROM ai.llm(
+    'Отвечай кратко по-русски.',
+    'Почему фильм повторяется в помесячном отчёте о выручке?',
+    p_skills => ARRAY['rental-revenue@1']
+);
+```
+
+`make_func(имя, описание)` сама загружает навыки из `ai.skill_binding` и возвращает их в `applied_skills`. Пустой `target_function` задаёт привязку ко всей схеме. Если один навык привязан и к схеме, и к имени функции, действует версия из привязки к функции.

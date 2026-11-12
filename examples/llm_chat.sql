@@ -18,15 +18,8 @@ SELECT * FROM llm(
     ]'::jsonb
 );
 
--- Модель можно спросить про собственную базу: каталог читается обычным SQL и
--- подставляется в пользовательский промпт.
+-- Имя public.country подключает сохранённый снимок схемы public.
 SELECT * FROM llm(
-    'Ты отвечаешь на русском. Опирайся только на переданный каталог.',
-    'Сколько столбцов у таблицы payment и какие из них обязательны? Ответь списком.'
-    || E'\n\n' || (
-        SELECT jsonb_pretty(r.value->'columns')
-        FROM ai.catalog_snapshot AS s
-        CROSS JOIN LATERAL jsonb_array_elements(s.metadata->'relations') AS r(value)
-        WHERE s.schema_name = 'public' AND r.value->>'name' = 'payment'
-    )
+    'Ты специалист по PostgreSQL. Отвечай на русском без предисловий.',
+    'С какими таблицами связана таблица public.country?'
 );
