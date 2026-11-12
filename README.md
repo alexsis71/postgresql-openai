@@ -4,18 +4,18 @@
 
 ## Что уже работает
 
-`ai.init_catalog()` сканирует выбранные схемы текущей базы, при необходимости добавляет небольшие выборки из указанных столбцов и вызывает OpenAI-совместимую модель. Результат сохраняется в `ai.catalog_snapshot`. Из него можно читать метаданные и обзор обычным SQL без повторного вызова модели.
+`ai.init_catalog('public')` сканирует одну схему текущей базы, при необходимости добавляет небольшие выборки из указанных столбцов и вызывает OpenAI-совместимую модель. В `ai.catalog_snapshot` хранится одна запись на схему. Повторный успешный вызов обновляет её с тем же `id`. Метаданные и обзор можно читать обычным SQL без повторного вызова модели.
 
-Проверено на `dvd_rent` в локальном Docker с PostgreSQL 17.10 и `qwen3.8-flash-next` на DGX. Снимок № 2 содержит 22 таблицы и представления, 10 функций и агрегатов и 2 пользовательских типа. Прогон с выборками занял около 56 секунд. [Сохранённый обзор модели](dvd_rent-synopsis.md)
+Демо использует `dvd_rent` в локальном Docker с PostgreSQL 17.10 и `qwen3.8-flash-next` на DGX. Каталог `public` содержит 22 таблицы и представления, 10 функций и агрегатов и 2 пользовательских типа. [Пример обзора модели](dvd_rent-synopsis.md)
 
 ## Файлы проекта
 
 | Файл | Назначение |
 | --- | --- |
 | [docs/design.md](docs/design.md) | Исходная постановка, цели, архитектура и план `make_func` |
-| [sql/install_catalog.sql](sql/install_catalog.sql) | Установка схем, таблиц и `ai.init_catalog()` |
-| [sql/init_dvd_rent.sql](sql/init_dvd_rent.sql) | Профиль Flash Next и создание снимка демо-базы |
-| [examples/inspect_catalog.sql](examples/inspect_catalog.sql) | Чтение последнего снимка, типов и связей таблицы платежей |
+| [sql/install_catalog.sql](sql/install_catalog.sql) | Установка и миграция каталога и `ai.init_catalog()` |
+| [sql/init_dvd_rent.sql](sql/init_dvd_rent.sql) | Профиль Flash Next и обновление каталога демо-базы |
+| [examples/inspect_catalog.sql](examples/inspect_catalog.sql) | Чтение каталога `public`, типов и связей таблицы платежей |
 | [examples/customer_revenue_baseline.sql](examples/customer_revenue_baseline.sql) | Эталонный запрос для проверки будущей `make_func` |
 | [dvdrental.tar](dvdrental.tar) | Исходный архив демо-базы для `pg_restore` |
 
@@ -37,7 +37,7 @@ docker cp .\dvdrental.tar postgres1:/tmp/dvdrental.tar
 docker exec postgres1 sh -c 'createdb -U "${POSTGRES_USER:-postgres}" dvd_rent && pg_restore --exit-on-error --no-owner --no-privileges -U "${POSTGRES_USER:-postgres}" -d dvd_rent /tmp/dvdrental.tar'
 ```
 
-Запустите скрипты под владельцем установки. Первый создаёт объекты в `dvd_rent`. Второй использует профиль `default` и при каждом успешном запуске создаёт новый снимок. Если профиль с этим именем уже есть, скрипт использует его настройки.
+Запустите скрипты под владельцем установки. Первый создаёт объекты в `dvd_rent` или обновляет существующую установку. При миграции из старого формата он оставляет для каждой схемы самый свежий снимок с его исходным `id`. Второй скрипт создаёт или обновляет каталог `public` с профилем `default`. Если профиль с этим именем уже есть, скрипт использует его настройки.
 
 ```powershell
 Get-Content -Raw .\sql\install_catalog.sql | docker exec -i postgres1 sh -c 'psql -X -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d dvd_rent'
@@ -55,15 +55,14 @@ SELECT ai.init_catalog();
 
 -- Add a small sample from a reference table.
 SELECT ai.init_catalog(
-    p_schemas => ARRAY['public'],
+    p_schema => 'public',
     p_samples => '{"public.category": ["category_id", "name"]}',
     p_sample_rows => 3,
     p_profile => 'default'
 );
 
--- Read the latest saved synopsis without contacting the model.
+-- Read the saved synopsis without contacting the model.
 SELECT id, model, synopsis
 FROM ai.catalog_snapshot
-ORDER BY id DESC
-LIMIT 1;
+WHERE schema_name = 'public';
 ```

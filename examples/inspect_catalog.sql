@@ -2,12 +2,10 @@
 
 SELECT id AS snapshot_id
 FROM ai.catalog_snapshot
-WHERE schemas @> ARRAY['public']
-ORDER BY id DESC
-LIMIT 1
+WHERE schema_name = 'public'
 \gset
 
-SELECT id, captured_at, database_name, schemas, profile, model,
+SELECT id, captured_at, database_name, schema_name, profile, model,
        jsonb_array_length(metadata->'relations') AS relations,
        jsonb_array_length(metadata->'routines') AS routines,
        jsonb_array_length(metadata->'types') AS custom_types

@@ -11,6 +11,7 @@ VALUES (
 ON CONFLICT (profile) DO NOTHING;
 
 SELECT ai.init_catalog(
+    p_schema => 'public',
     p_samples => '{
         "public.category": ["category_id", "name"],
         "public.language": ["language_id", "name"],
@@ -19,7 +20,7 @@ SELECT ai.init_catalog(
     }'::jsonb
 ) AS snapshot_id \gset
 
-SELECT id, database_name, schemas, model,
+SELECT id, captured_at, database_name, schema_name, model,
        jsonb_array_length(metadata->'relations') AS relation_count,
        jsonb_array_length(metadata->'routines') AS routine_count,
        sample_manifest

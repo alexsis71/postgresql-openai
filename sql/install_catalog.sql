@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS ai.catalog_snapshot (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     captured_at timestamptz NOT NULL,
     database_name name NOT NULL,
-    schemas text[] NOT NULL,
+    schema_name text NOT NULL UNIQUE,
     metadata jsonb NOT NULL,
     sample_manifest jsonb NOT NULL,
     profile text NOT NULL,
@@ -27,8 +27,44 @@ CREATE TABLE IF NOT EXISTS ai.catalog_snapshot (
     synopsis text NOT NULL CHECK (btrim(synopsis) <> '')
 );
 
+DO $migration$
+BEGIN
+    LOCK TABLE ai.catalog_snapshot IN ACCESS EXCLUSIVE MODE;
+    IF EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = 'ai.catalog_snapshot'::regclass
+          AND attname = 'schemas' AND NOT attisdropped
+    ) THEN
+        IF EXISTS (
+            SELECT 1 FROM ai.catalog_snapshot
+            WHERE cardinality(schemas) <> 1 OR schemas[1] IS NULL
+        ) THEN
+            RAISE EXCEPTION 'Legacy catalog contains a snapshot without exactly one schema'
+                USING HINT = 'Export and remove legacy combined snapshots before migrating, then initialize their schemas individually.';
+        END IF;
+
+        DELETE FROM ai.catalog_snapshot AS older
+        USING ai.catalog_snapshot AS newer
+        WHERE older.schemas[1] = newer.schemas[1]
+          AND (older.captured_at, older.id) < (newer.captured_at, newer.id);
+
+        ALTER TABLE ai.catalog_snapshot ADD COLUMN schema_name text;
+        UPDATE ai.catalog_snapshot
+        SET schema_name = schemas[1],
+            metadata = (metadata - 'schemas') || jsonb_build_object('schema', schemas[1]);
+
+        ALTER TABLE ai.catalog_snapshot
+            ALTER COLUMN schema_name SET NOT NULL,
+            ADD UNIQUE (schema_name),
+            DROP COLUMN schemas;
+    END IF;
+END;
+$migration$;
+
+DROP FUNCTION IF EXISTS ai.init_catalog(text[], jsonb, integer, text);
+
 CREATE OR REPLACE FUNCTION ai.init_catalog(
-    p_schemas text[] DEFAULT ARRAY['public'],
+    p_schema text DEFAULT 'public',
     p_samples jsonb DEFAULT '{}',
     p_sample_rows integer DEFAULT 3,
     p_profile text DEFAULT 'default'
@@ -56,19 +92,15 @@ DECLARE
     v_synopsis text;
     v_id bigint;
 BEGIN
-    IF coalesce(cardinality(p_schemas), 0) = 0 OR EXISTS (
+    IF NOT EXISTS (
         SELECT 1
-        FROM unnest(p_schemas) AS s(schema_name)
-        LEFT JOIN pg_namespace AS n ON n.nspname::text = s.schema_name
-        WHERE n.oid IS NULL OR n.nspname = 'information_schema'
-           OR n.nspname LIKE 'pg\_%' OR n.nspname IN ('ai', 'ai_http')
+        FROM pg_namespace AS n
+        WHERE n.nspname::text = p_schema
+          AND n.nspname NOT LIKE 'pg\_%'
+          AND n.nspname NOT IN ('information_schema', 'ai', 'ai_http')
     ) THEN
-        RAISE EXCEPTION 'Specify existing application schemas';
+        RAISE EXCEPTION 'Specify an existing application schema: %', p_schema;
     END IF;
-
-    SELECT array_agg(DISTINCT schema_name ORDER BY schema_name)
-    INTO p_schemas
-    FROM unnest(p_schemas) AS s(schema_name);
 
     IF p_sample_rows IS NULL OR p_sample_rows NOT BETWEEN 1 AND 5 THEN
         RAISE EXCEPTION 'p_sample_rows must be between 1 and 5';
@@ -89,17 +121,17 @@ BEGIN
         SELECT c.oid, n.nspname, c.relname, c.relkind, c.relrowsecurity
         FROM pg_class AS c
         JOIN pg_namespace AS n ON n.oid = c.relnamespace
-        WHERE n.nspname::text = ANY(p_schemas) AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+        WHERE n.nspname::text = p_schema AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
     ), routines AS (
         SELECT n.nspname, p.proname, p.prokind, p.oid,
                pg_get_function_identity_arguments(p.oid) AS arguments
         FROM pg_proc AS p
         JOIN pg_namespace AS n ON n.oid = p.pronamespace
-        WHERE n.nspname::text = ANY(p_schemas)
+        WHERE n.nspname::text = p_schema
     )
     SELECT jsonb_build_object(
         'database', current_database(),
-        'schemas', p_schemas,
+        'schema', p_schema,
         'relations', coalesce((
             SELECT jsonb_agg(jsonb_build_object(
                 'schema', r.nspname,
@@ -173,7 +205,7 @@ BEGIN
             ) ORDER BY n.nspname, t.typname)
             FROM pg_type AS t
             JOIN pg_namespace AS n ON n.oid = t.typnamespace
-            WHERE n.nspname::text = ANY(p_schemas) AND t.typtype IN ('d', 'e')
+            WHERE n.nspname::text = p_schema AND t.typtype IN ('d', 'e')
         ), '[]'::jsonb)
     ) INTO v_metadata;
 
@@ -181,11 +213,11 @@ BEGIN
         SELECT c.oid, n.nspname, c.relname INTO v_relation
         FROM pg_class AS c
         JOIN pg_namespace AS n ON n.oid = c.relnamespace
-        WHERE n.nspname::text = ANY(p_schemas)
+        WHERE n.nspname::text = p_schema
           AND c.relkind IN ('r', 'p')
           AND format('%I.%I', n.nspname, c.relname) = v_sample.key;
         IF NOT FOUND THEN
-            RAISE EXCEPTION 'Sample target must be a table in the requested schemas: %', v_sample.key;
+            RAISE EXCEPTION 'Sample target must be a table in the requested schema: %', v_sample.key;
         END IF;
         IF jsonb_typeof(v_sample.value) <> 'array' THEN
             RAISE EXCEPTION 'Sample columns must be an array for %', v_sample.key;
@@ -237,7 +269,7 @@ BEGIN
 
     v_context := jsonb_build_object('catalog', v_metadata, 'sample_rows_as_text', v_samples)::text;
     IF octet_length(v_context) > 250000 THEN
-        RAISE EXCEPTION 'Catalog exceeds 250000 bytes; initialize a smaller set of schemas';
+        RAISE EXCEPTION 'Catalog for schema % exceeds 250000 bytes', p_schema;
     END IF;
 
     v_request := v_profile.request_options ||
@@ -279,16 +311,31 @@ $prompt$),
             v_payload #>> '{choices,0,finish_reason}';
     END IF;
 
-    INSERT INTO ai.catalog_snapshot (
-        captured_at, database_name, schemas, metadata, sample_manifest, profile, model, synopsis
+    INSERT INTO ai.catalog_snapshot AS snapshot (
+        captured_at, database_name, schema_name, metadata, sample_manifest, profile, model, synopsis
     ) VALUES (
-        v_started, current_database(), p_schemas, v_metadata, v_manifest, p_profile,
+        v_started, current_database(), p_schema, v_metadata, v_manifest, p_profile,
         coalesce(v_payload->>'model', v_profile.model), v_synopsis
-    ) RETURNING id INTO v_id;
+    )
+    ON CONFLICT (schema_name) DO UPDATE SET
+        captured_at = EXCLUDED.captured_at,
+        database_name = EXCLUDED.database_name,
+        metadata = EXCLUDED.metadata,
+        sample_manifest = EXCLUDED.sample_manifest,
+        profile = EXCLUDED.profile,
+        model = EXCLUDED.model,
+        synopsis = EXCLUDED.synopsis
+    WHERE snapshot.captured_at <= EXCLUDED.captured_at
+    RETURNING id INTO v_id;
+
+    -- A later-started refresh may already have published this schema.
+    IF NOT FOUND THEN
+        SELECT id INTO STRICT v_id FROM ai.catalog_snapshot WHERE schema_name = p_schema;
+    END IF;
 
     RETURN v_id;
 END;
 $function$;
 
-REVOKE ALL ON FUNCTION ai.init_catalog(text[], jsonb, integer, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION ai.init_catalog(text, jsonb, integer, text) FROM PUBLIC;
 COMMIT;
