@@ -69,6 +69,77 @@ $migration$;
 
 DROP FUNCTION IF EXISTS ai.init_catalog(text[], jsonb, integer, text);
 
+CREATE OR REPLACE FUNCTION ai._get_model_profile(p_profile text)
+RETURNS ai.model_profile
+LANGUAGE plpgsql
+STABLE
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_name text := coalesce(p_profile, nullif(btrim(current_setting('ai.model_profile', true)), ''), 'default');
+    v_profile ai.model_profile%ROWTYPE;
+BEGIN
+    SELECT * INTO v_profile FROM ai.model_profile WHERE profile = v_name;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Unknown model profile: %', v_name;
+    END IF;
+    RETURN v_profile;
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION ai.register_model_profile(p_base_url text, p_profile text DEFAULT NULL)
+RETURNS text
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog
+SET http.curlopt_connecttimeout_ms = '3000'
+SET http.curlopt_timeout_ms = '10000'
+AS $function$
+DECLARE
+    v_base_url text := rtrim(btrim(p_base_url), '/');
+    v_response ai_http.http_response;
+    v_models jsonb;
+    v_model text;
+    v_name text;
+BEGIN
+    IF v_base_url IS NULL OR v_base_url !~ '^https?://[^/?#@[:space:]]+(/[^?#[:space:]]*)?/v1$' THEN
+        RAISE EXCEPTION 'Provide an HTTP(S) base URL ending in /v1';
+    END IF;
+    IF p_profile IS NOT NULL AND btrim(p_profile) = '' THEN
+        RAISE EXCEPTION 'Provide a non-empty profile name or omit it';
+    END IF;
+
+    PERFORM ai_http.http_list_curlopt();
+    PERFORM set_config('http.curlopt_connecttimeout_ms', '3000', true);
+    PERFORM set_config('http.curlopt_timeout_ms', '10000', true);
+    SELECT * INTO v_response FROM ai_http.http_get(v_base_url || '/models');
+    IF v_response.status NOT BETWEEN 200 AND 299 THEN
+        RAISE EXCEPTION 'Model discovery returned HTTP %', v_response.status;
+    END IF;
+
+    v_models := v_response.content::jsonb->'data';
+    IF jsonb_typeof(v_models) IS DISTINCT FROM 'array' THEN
+        RAISE EXCEPTION 'Model discovery response is missing the data array';
+    END IF;
+    IF jsonb_array_length(v_models) <> 1 THEN
+        RAISE EXCEPTION 'Model discovery requires exactly one model, endpoint advertises %',
+            jsonb_array_length(v_models);
+    END IF;
+    v_model := v_models #>> '{0,id}';
+    IF jsonb_typeof(v_models #> '{0,id}') IS DISTINCT FROM 'string' OR btrim(v_model) = '' THEN
+        RAISE EXCEPTION 'Model discovery response is missing a model ID';
+    END IF;
+
+    v_name := coalesce(btrim(p_profile), v_model);
+    INSERT INTO ai.model_profile (profile, endpoint, model, request_options)
+    VALUES (v_name, v_base_url || '/chat/completions', v_model,
+        CASE WHEN (v_models->0) ? 'max_model_len' THEN '{"chat_template_kwargs": {}}'::jsonb
+             ELSE '{}'::jsonb END)
+    ON CONFLICT (profile) DO UPDATE SET endpoint = EXCLUDED.endpoint, model = EXCLUDED.model;
+    RETURN v_name;
+END;
+$function$;
+
 CREATE OR REPLACE FUNCTION ai._complete(p_profile ai.model_profile, p_messages jsonb)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -80,11 +151,31 @@ DECLARE
     v_request jsonb;
     v_response ai_http.http_response;
     v_payload jsonb;
+    v_thinking text := nullif(btrim(current_setting('ai.enable_thinking', true)), '');
+    v_effort text := nullif(lower(btrim(current_setting('ai.reasoning_effort', true))), '');
+    v_message_bytes integer := octet_length(p_messages::text);
 BEGIN
-    v_request := p_profile.request_options ||
+    IF v_message_bytes > p_profile.max_context_length THEN
+        RAISE EXCEPTION 'Context of % bytes exceeds max_context_length % of profile %',
+            v_message_bytes, p_profile.max_context_length, p_profile.profile;
+    END IF;
+    IF v_effort IS NOT NULL AND v_effort NOT IN ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max') THEN
+        RAISE EXCEPTION 'Invalid ai.reasoning_effort: %', v_effort;
+    END IF;
+
+    v_request := (p_profile.request_options - 'reasoning_effort') ||
         CASE WHEN p_profile.request_options ? 'max_completion_tokens' THEN '{}'::jsonb
              ELSE jsonb_build_object('max_tokens', p_profile.max_tokens) END ||
         jsonb_build_object('model', p_profile.model, 'stream', false, 'messages', p_messages);
+
+    IF v_thinking IS NOT NULL OR v_request ? 'chat_template_kwargs' THEN
+        v_request := jsonb_set(v_request, '{chat_template_kwargs}',
+            coalesce(v_request->'chat_template_kwargs', '{}'::jsonb) ||
+            jsonb_build_object('enable_thinking', coalesce(v_thinking::boolean, false)));
+    END IF;
+    IF v_effort IS NOT NULL THEN
+        v_request := v_request || jsonb_build_object('reasoning_effort', v_effort);
+    END IF;
 
     -- Load the HTTP library before setting its options in a fresh backend.
     PERFORM ai_http.http_list_curlopt();
@@ -110,7 +201,7 @@ CREATE OR REPLACE FUNCTION ai.init_catalog(
     p_schema text DEFAULT 'public',
     p_samples jsonb DEFAULT '{}',
     p_sample_rows integer DEFAULT 3,
-    p_profile text DEFAULT 'default'
+    p_profile text DEFAULT NULL
 ) RETURNS bigint
 LANGUAGE plpgsql
 SET search_path = pg_catalog
@@ -151,10 +242,7 @@ BEGIN
         RAISE EXCEPTION 'At most 8 sample tables are supported';
     END IF;
 
-    SELECT * INTO v_profile FROM ai.model_profile WHERE profile = p_profile;
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'Unknown model profile: %', p_profile;
-    END IF;
+    v_profile := ai._get_model_profile(p_profile);
 
     WITH relations AS (
         SELECT c.oid, n.nspname, c.relname, c.relkind, c.relrowsecurity
@@ -307,10 +395,6 @@ BEGIN
     END LOOP;
 
     v_context := jsonb_build_object('catalog', v_metadata, 'sample_rows_as_text', v_samples)::text;
-    IF octet_length(v_context) > 250000 THEN
-        RAISE EXCEPTION 'Catalog for schema % exceeds 250000 bytes', p_schema;
-    END IF;
-
     v_payload := ai._complete(v_profile, jsonb_build_array(
             jsonb_build_object('role', 'system', 'content', $prompt$
 Write a developer-facing database synopsis in Russian, in Markdown, up to 650 words.
@@ -329,7 +413,7 @@ $prompt$),
     INSERT INTO ai.catalog_snapshot AS snapshot (
         captured_at, database_name, schema_name, metadata, sample_manifest, profile, model, synopsis
     ) VALUES (
-        v_started, current_database(), p_schema, v_metadata, v_manifest, p_profile,
+        v_started, current_database(), p_schema, v_metadata, v_manifest, v_profile.profile,
         coalesce(v_payload->>'model', v_profile.model), v_synopsis
     )
     ON CONFLICT (schema_name) DO UPDATE SET
@@ -404,13 +488,7 @@ BEGIN
     IF v_catalog IS NULL THEN
         RAISE EXCEPTION 'Initialize a schema catalog before generating a function';
     END IF;
-    IF octet_length(v_catalog::text) + octet_length(p_description) > 250000 THEN
-        RAISE EXCEPTION 'Catalog and description exceed 250000 bytes';
-    END IF;
-    SELECT * INTO v_profile FROM ai.model_profile WHERE profile = 'default';
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'Unknown model profile: default';
-    END IF;
+    v_profile := ai._get_model_profile(NULL);
 
     v_payload := ai._complete(v_profile, jsonb_build_array(
         jsonb_build_object('role', 'system', 'content', $prompt$
@@ -541,12 +619,10 @@ $prompt$),
 END;
 $function$;
 
-DROP FUNCTION IF EXISTS ai.llm(text, text, text, jsonb);
-
 CREATE OR REPLACE FUNCTION ai.llm(
     p_system text,
     p_user text,
-    p_profile text DEFAULT 'default',
+    p_profile text DEFAULT NULL,
     p_history jsonb DEFAULT '[]'::jsonb
 ) RETURNS TABLE (
     answer text,
@@ -572,10 +648,7 @@ BEGIN
         RAISE EXCEPTION 'Provide a user prompt';
     END IF;
 
-    SELECT * INTO v_profile FROM ai.model_profile AS mp WHERE mp.profile = p_profile;
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'Unknown model profile: %', p_profile;
-    END IF;
+    v_profile := ai._get_model_profile(p_profile);
 
     IF nullif(btrim(coalesce(p_system, '')), '') IS NOT NULL THEN
         v_messages := v_messages || jsonb_build_array(
@@ -595,11 +668,6 @@ BEGIN
     END IF;
     v_messages := v_messages || p_history
         || jsonb_build_array(jsonb_build_object('role', 'user', 'content', p_user));
-    IF octet_length(v_messages::text) > v_profile.max_context_length THEN
-        RAISE EXCEPTION 'Chat context of % bytes exceeds max_context_length % of profile %',
-            octet_length(v_messages::text), v_profile.max_context_length, v_profile.profile;
-    END IF;
-
     v_payload := ai._complete(v_profile, v_messages);
     answer := v_payload #>> '{choices,0,message,content}';
     model := coalesce(v_payload->>'model', v_profile.model);
@@ -613,12 +681,10 @@ BEGIN
 END;
 $function$;
 
-DROP FUNCTION IF EXISTS public.llm(text, text, text, jsonb);
-
 CREATE OR REPLACE FUNCTION public.llm(
     p_system text,
     p_user text,
-    p_profile text DEFAULT 'default',
+    p_profile text DEFAULT NULL,
     p_history jsonb DEFAULT '[]'::jsonb
 ) RETURNS TABLE (
     answer text,
@@ -637,6 +703,8 @@ AS $function$
     SELECT * FROM ai.llm(p_system, p_user, p_profile, p_history) AS chat;
 $function$;
 
+REVOKE ALL ON FUNCTION ai._get_model_profile(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION ai.register_model_profile(text, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION ai._complete(ai.model_profile, jsonb) FROM PUBLIC;
 REVOKE ALL ON FUNCTION ai.init_catalog(text, jsonb, integer, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION ai.make_func(text, text) FROM PUBLIC;
