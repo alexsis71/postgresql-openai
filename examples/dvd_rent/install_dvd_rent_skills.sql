@@ -38,6 +38,7 @@ ON CONFLICT (name, version) DO NOTHING;
 INSERT INTO ai.skill_binding (target_schema, target_function, skill_name, skill_version)
 VALUES
     ('reporting', 'film_box_office', 'rental-revenue', 1),
+    ('reporting', 'monthly_film_revenue', 'rental-revenue', 1),
     ('reporting', 'customer_revenue', 'rental-revenue', 1),
     ('public', 'customer_revenue', 'rental-revenue', 1)
 ON CONFLICT (target_schema, target_function, skill_name) DO NOTHING;

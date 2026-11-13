@@ -115,6 +115,23 @@ ORDER BY id DESC;
 В `ai.function_generation.catalog_selection` сохраняются режим, размер исходного
 и переданного снимка, входные токены генератора и время создания с учётом ревью.
 
+### Генерация представления
+
+`ai.make_view(имя, описание)` использует сохранённый снимок, навыки и настройки
+профиля так же, как `make_func`. После вердикта `pass` создаётся обычное
+представление `SECURITY INVOKER`. Чтение выполняется с правами вызывающего
+и без обращения к модели. Уже существующее отношение с тем же именем вызывает ошибку.
+
+Пример на демобазе создаёт помесячную выручку по фильмам и сверяет все строки
+с эталоном. [SQL-сценарий](examples/dvd_rent/make_view_monthly_film_revenue.sql)
+
+```sql
+SELECT created_at, signature, report_contract, applied_skills, review->>'verdict' AS verdict
+FROM ai.function_generation
+WHERE object_kind = 'view'
+ORDER BY id DESC;
+```
+
 ### Ревью функций
 
 `make_func` перед созданием запрашивает отдельное LLM-ревью с навыком `review-function@1`.
