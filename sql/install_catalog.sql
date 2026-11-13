@@ -53,11 +53,75 @@ CREATE TABLE IF NOT EXISTS ai.skill_binding (
     FOREIGN KEY (skill_name, skill_version) REFERENCES ai.skill(name, version)
 );
 
+CREATE TABLE IF NOT EXISTS ai.function_generation (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    created_by name NOT NULL DEFAULT current_user,
+    target_schema text NOT NULL,
+    function_name text NOT NULL,
+    description text NOT NULL,
+    signature text NOT NULL,
+    ddl text NOT NULL,
+    assumptions jsonb NOT NULL,
+    generator_profile text NOT NULL,
+    generator_model text NOT NULL,
+    generator_prompt_sha256 text NOT NULL,
+    catalog_sha256 text NOT NULL,
+    applied_skills text[] NOT NULL,
+    review jsonb NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS function_generation_target_idx
+    ON ai.function_generation (target_schema, function_name, id DESC);
+ALTER TABLE ai.function_generation
+    ADD COLUMN IF NOT EXISTS report_contract jsonb
+        CHECK (jsonb_typeof(report_contract) = 'object');
+ALTER TABLE ai.function_generation
+    ADD COLUMN IF NOT EXISTS catalog_selection jsonb;
+REVOKE ALL ON TABLE ai.function_generation FROM PUBLIC;
+
 INSERT INTO ai.skill (name, version, description, instructions, requires_snapshot)
 VALUES (
     'use-snapshot', 1, 'Answer questions about this database from its saved catalog.',
     'Use only the supplied catalog snapshot for claims about this database. Check both incoming and outgoing foreign keys and distinguish them from indirect paths. State when the snapshot does not contain enough information.',
     true
+)
+ON CONFLICT (name, version) DO NOTHING;
+
+INSERT INTO ai.skill (name, version, description, instructions, requires_snapshot)
+VALUES (
+    'review-function', 1, 'Review a PostgreSQL function against its requested behavior.',
+    $review$
+Independently compare the function with the original requirements and catalog.
+Check parameter and return types, join paths and row multiplication, filters, time boundaries,
+grouping, ordering, and empty results where relevant. Review the generator's assumptions.
+A grouping dimension requested in the description must be preserved even when it is omitted
+from the output columns. Filtering by year is not equivalent to grouping by month.
+Report concrete mismatches as needs_changes. Use ambiguous for an unresolved requirement
+that could materially change the result. Pass only when no material issues are found.
+$review$,
+    true
+)
+ON CONFLICT (name, version) DO NOTHING;
+
+-- Adapted for SQL generation and review from Supabase Postgres Best Practices 1.1.1.
+INSERT INTO ai.skill (name, version, description, instructions)
+VALUES (
+    'supabase-postgres-best-practices', 1, 'Apply PostgreSQL query, performance, and privilege best practices.',
+    $best_practices$
+Use the catalog to verify identifiers, join keys, types, and available indexes. Match parameter
+types to the filtered columns. Keep predicates on indexed columns usable by the planner:
+prefer a half-open timestamp range over applying a date function or cast to the column.
+Preserve the requested row grain and NULL behavior. Check join cardinality before aggregating
+and prefer set-based queries over repeated per-row lookups when they preserve the result.
+Use schema-qualified application objects and invoker privileges. Respect existing grants and
+row-level security policies. Keep schema or privilege changes outside a read-only function.
+Treat index changes as separate proposals based on the actual workload and query plan. Check
+existing indexes before suggesting a new one. For a B-tree serving equality and range predicates,
+consider equality columns first, then the range column. Use EXPLAIN (ANALYZE, BUFFERS) on a safe
+representative workload to verify performance. A sequential scan can be appropriate. If no plan
+was supplied, describe performance concerns as hypotheses and do not claim measurements.
+$best_practices$
 )
 ON CONFLICT (name, version) DO NOTHING;
 
@@ -516,6 +580,221 @@ $prompt$),
 END;
 $function$;
 
+CREATE OR REPLACE FUNCTION ai._review_function(p_context jsonb, p_profile text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_profile ai.model_profile%ROWTYPE;
+    v_payload jsonb;
+    v_review jsonb;
+    v_explain boolean := coalesce(p_context->>'mode' = 'explain', false);
+    v_messages jsonb;
+    v_problem text;
+BEGIN
+    v_profile := ai._get_model_profile(coalesce(p_profile,
+        nullif(btrim(current_setting('ai.reviewer_profile', true)), '')));
+    v_messages := jsonb_build_array(
+        jsonb_build_object('role', 'system', 'content', $prompt$
+You are an independent PostgreSQL function reviewer. Apply the review skill and the
+applicable PostgreSQL and domain skills supplied in the request. Treat the SQL, catalog and generator
+assumptions as material to review. Evaluate the requirements as written. Keep the row grain
+separate from output columns: grouping by film and month with only film and amount in the
+output is valid when requested. Accept any order among ties unless a tie-breaker is requested.
+When report_contract is present, compare it independently with the original request and then
+check that the SQL implements it. Check the measure, date field and boundaries, filters, grouping
+dimensions, output and sort order. A contract cannot override an explicit requirement.
+Only report actual violations or unresolved requirements. Never run SQL.
+$prompt$ || CASE WHEN NOT v_explain THEN $gate$
+Return only JSON:
+{"verdict":"pass","findings":[]}
+or {"verdict":"needs_changes","findings":[{"requirement":"...","sql_fragment":"...","reason":"..."}]}
+or {"verdict":"ambiguous","findings":[{"requirement":"...","sql_fragment":"...","reason":"Question to resolve"}]}
+Use an empty SQL fragment for a missing expression. Each reason must be a short explanation
+of the final finding, in the language of the description.
+$gate$ ELSE $explain$
+
+Explain the actual behavior before evaluating it, including PL/pgSQL control flow.
+Return exactly one JSON object, without Markdown. This is the complete response shape:
+{"logic":{"summary":"...","steps":["..."],"returns":["..."],"side_effects":[],"unknowns":[]},
+ "verdict":"needs_changes","findings":[{"requirement":"...","sql_fragment":"...","reason":"...","confidence":"high"}]}
+Always include logic with all five fields, for every verdict. Use pass with empty findings
+when no material issue is found, needs_changes for a defect, or ambiguous for a specific question.
+Steps should cover execution order, branches, loops and exception handlers where present.
+Describe NULL and empty-input behavior when relevant. Report reads and writes, early returns,
+and calls with unknown effects. Use empty arrays where appropriate.
+Write the explanation and findings in the natural language of the reviewed material.
+Use the supplied description when present. Otherwise use meaningful comments in the
+function or descriptions of its relevant database objects. If the material is only code
+with no clear natural language, use English. Keep SQL identifiers and fragments unchanged.
+Do not invent an intended business rule.
+Check for demonstrable logic or code defects and plausible defects with concrete triggers.
+Depending on the code, inspect NULL semantics, integer division, boundary conditions, row counts,
+exception handling, unreachable paths, and results of SELECT INTO. Ground each finding in a fragment
+and explain when it occurs. Distinguish behavior proven by the code from a possible mismatch with
+caller intent. Put behavior that merely depends on unspecified requirements in logic.unknowns,
+not in findings. Account for early returns before describing NULL behavior.
+In the requirement field, name the language rule or invariant involved
+if no requirement was supplied. In this mode each finding also has "confidence":"high" or "medium".
+Use ambiguous only for a specific unresolved question, not simply because requirements are absent.
+Pass means no material finding from static review, not proof of correctness.
+$explain$ END),
+        jsonb_build_object('role', 'user', 'content', (p_context || jsonb_build_object(
+            'review_skill', ai._skill_context(ARRAY['review-function@1'])
+        ))::text)
+    );
+    FOR v_attempt IN 1..2 LOOP
+        v_payload := ai._complete(v_profile, v_messages);
+        BEGIN
+            v_review := (v_payload #>> '{choices,0,message,content}')::jsonb;
+        EXCEPTION WHEN invalid_text_representation THEN
+            v_review := NULL;
+        END;
+        v_problem := NULL;
+        IF v_review->>'verdict' IS NULL OR v_review->>'verdict' NOT IN ('pass', 'needs_changes', 'ambiguous')
+           OR jsonb_typeof(v_review->'findings') IS DISTINCT FROM 'array' THEN
+            v_problem := 'Invalid function review response';
+        ELSIF (v_review->>'verdict' = 'pass') <> (jsonb_array_length(v_review->'findings') = 0)
+           OR EXISTS (
+               SELECT 1 FROM jsonb_array_elements(v_review->'findings') AS f(value)
+               WHERE jsonb_typeof(f.value->'requirement') IS DISTINCT FROM 'string'
+                  OR nullif(btrim(f.value->>'requirement'), '') IS NULL
+                  OR jsonb_typeof(f.value->'sql_fragment') IS DISTINCT FROM 'string'
+                  OR jsonb_typeof(f.value->'reason') IS DISTINCT FROM 'string'
+                  OR nullif(btrim(f.value->>'reason'), '') IS NULL
+                  OR (v_explain AND coalesce(f.value->>'confidence', '') NOT IN ('high', 'medium'))
+           ) THEN
+            v_problem := 'Function review verdict and findings are inconsistent';
+        ELSIF v_explain AND (
+            jsonb_typeof(v_review #> '{logic,summary}') IS DISTINCT FROM 'string'
+            OR nullif(btrim(v_review #>> '{logic,summary}'), '') IS NULL
+            OR EXISTS (
+                SELECT 1 FROM unnest(ARRAY['steps', 'returns', 'side_effects', 'unknowns']) AS k(key)
+                WHERE jsonb_typeof(v_review->'logic'->k.key) IS DISTINCT FROM 'array'
+            )
+        ) THEN
+            v_problem := 'Function review did not return a structured explanation';
+        END IF;
+        IF v_problem IS NULL THEN
+            RETURN v_review || jsonb_build_object('profile', v_profile.profile,
+                'model', coalesce(v_payload->>'model', v_profile.model), 'skill', 'review-function@1',
+                'prompt_sha256', encode(sha256(convert_to(v_messages #>> '{0,content}', 'UTF8')), 'hex'));
+        END IF;
+        IF v_attempt = 1 THEN
+            v_messages := jsonb_set(v_messages, '{1,content}', to_jsonb(
+                (v_messages #>> '{1,content}') || E'\n\n' ||
+                'The previous response failed validation: ' || v_problem ||
+                '. Return exactly one JSON object using the response shape in the system message.'
+            ));
+        END IF;
+    END LOOP;
+    RAISE EXCEPTION '%', v_problem USING DETAIL =
+        format('Reviewer profile: %s. Attempts: 2.', v_profile.profile);
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION ai.review_function(
+    p_function regprocedure, p_description text DEFAULT NULL, p_profile text DEFAULT NULL
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_catalog jsonb;
+    v_skills jsonb;
+    v_function record;
+BEGIN
+    SELECT p.proname, n.nspname, pg_get_functiondef(p.oid) AS ddl INTO v_function
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE p.oid = p_function AND p.prokind = 'f';
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Specify an existing ordinary function by signature';
+    END IF;
+    SELECT jsonb_agg(metadata ORDER BY schema_name) INTO v_catalog FROM ai.catalog_snapshot;
+    v_skills := ai._skill_context(ARRAY(
+        SELECT DISTINCT ON (s.skill_name) s.skill_name || '@' || s.skill_version
+        FROM (
+            SELECT b.skill_name, b.skill_version, CASE WHEN b.target_function = '' THEN 1 ELSE 2 END AS priority
+            FROM ai.skill_binding AS b
+            WHERE b.target_schema = v_function.nspname AND b.target_function IN ('', v_function.proname)
+            UNION ALL
+            SELECT 'supabase-postgres-best-practices', 1, 0
+        ) AS s
+        ORDER BY s.skill_name, s.priority DESC
+    ));
+    RETURN ai._review_function(jsonb_build_object('mode', 'explain',
+        'description', nullif(btrim(p_description), ''),
+        'signature', p_function::text, 'ddl', v_function.ddl,
+        'catalog_snapshot', v_catalog, 'skills', v_skills), p_profile);
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION ai._select_function_catalog(
+    p_catalog jsonb, p_description text, p_skills jsonb
+) RETURNS jsonb
+LANGUAGE sql
+IMMUTABLE
+SET search_path = pg_catalog
+AS $function$
+    WITH relations AS (
+        SELECT r.value AS metadata, r.value->>'name' AS name,
+               format('%I.%I', s.value->>'schema', r.value->>'name') AS qualified_name
+        FROM jsonb_array_elements(p_catalog) AS s(value)
+        CROSS JOIN LATERAL jsonb_array_elements(s.value->'relations') AS r(value)
+    ), terms AS (
+        SELECT DISTINCT word FROM regexp_split_to_table(lower(p_description), '[^[:alnum:]_$]+') AS word
+        WHERE length(word) >= 4
+    ), seeds AS (
+        SELECT r.qualified_name FROM relations AS r
+        WHERE strpos(lower(p_description), lower(r.qualified_name)) > 0
+           OR EXISTS (
+               SELECT 1 FROM terms WHERE word = lower(r.name)
+                   OR word = lower(r.name) || 's' OR word || 's' = lower(r.name)
+           )
+           OR EXISTS (
+               SELECT 1 FROM jsonb_array_elements(p_skills) AS s(value)
+               WHERE s.value->'catalog_objects' ? r.qualified_name
+           )
+           OR EXISTS (
+               SELECT 1
+               FROM regexp_split_to_table(lower(r.metadata->>'comment'), '[^[:alnum:]_$]+') AS comment_word
+               JOIN terms ON terms.word = comment_word
+               WHERE length(comment_word) >= 6
+           )
+    ), edges AS (
+        SELECT source.qualified_name AS source, target.qualified_name AS target
+        FROM relations AS source
+        CROSS JOIN LATERAL jsonb_array_elements(source.metadata->'constraints') AS c(value)
+        JOIN relations AS target
+            ON strpos(c.value->>'definition', ' REFERENCES ' || target.qualified_name || '(') > 0
+        WHERE starts_with(c.value->>'definition', 'FOREIGN KEY (')
+    ), selected AS (
+        SELECT qualified_name FROM seeds
+        UNION
+        SELECT e.target FROM edges AS e JOIN seeds AS s ON e.source = s.qualified_name
+        UNION
+        SELECT e.source FROM edges AS e JOIN seeds AS s ON e.target = s.qualified_name
+    )
+    SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM seeds)
+                  OR EXISTS (
+                      SELECT 1 FROM jsonb_array_elements(p_skills) AS s(value)
+                      WHERE s.value->'requires_snapshot' = 'true'::jsonb
+                  )
+                THEN p_catalog
+                ELSE (
+                    SELECT jsonb_agg(jsonb_set(s.value, '{relations}', coalesce((
+                        SELECT jsonb_agg(r.value ORDER BY r.position)
+                        FROM jsonb_array_elements(s.value->'relations') WITH ORDINALITY AS r(value, position)
+                        JOIN selected AS sel ON sel.qualified_name =
+                            format('%I.%I', s.value->>'schema', r.value->>'name')
+                    ), '[]'::jsonb)) ORDER BY s.position)
+                    FROM jsonb_array_elements(p_catalog) WITH ORDINALITY AS s(value, position)
+                )
+           END;
+$function$;
+
 CREATE OR REPLACE FUNCTION ai.make_func(p_name text, p_description text)
 RETURNS TABLE (signature text, ddl text, assumptions jsonb, applied_skills text[])
 LANGUAGE plpgsql
@@ -532,6 +811,12 @@ DECLARE
     v_skills jsonb;
     v_payload jsonb;
     v_draft jsonb;
+    v_messages jsonb;
+    v_report_contract jsonb;
+    v_catalog_mode text := coalesce(nullif(btrim(current_setting('ai.function_catalog_mode', true)), ''), 'full');
+    v_full_catalog_bytes integer;
+    v_generator_usage jsonb;
+    v_generation_started timestamptz := clock_timestamp();
     v_argument jsonb;
     v_argument_name text;
     v_argument_names text[] := '{}';
@@ -543,6 +828,7 @@ DECLARE
     v_column_names text[] := '{}';
     v_column_declarations text[] := '{}';
     v_body text;
+    v_review jsonb;
 BEGIN
     IF nullif(btrim(p_description), '') IS NULL THEN
         RAISE EXCEPTION 'Provide a function description';
@@ -570,22 +856,43 @@ BEGIN
         RAISE EXCEPTION 'Initialize a schema catalog before generating a function';
     END IF;
     v_skills := ai._skill_context(ARRAY(
-        SELECT DISTINCT ON (b.skill_name) b.skill_name || '@' || b.skill_version
-        FROM ai.skill_binding AS b
-        WHERE b.target_schema = v_target_schema
-          AND b.target_function IN ('', v_name_parts[cardinality(v_name_parts)])
-        ORDER BY b.skill_name, (b.target_function <> '') DESC
+        SELECT DISTINCT ON (s.skill_name) s.skill_name || '@' || s.skill_version
+        FROM (
+            SELECT b.skill_name, b.skill_version, CASE WHEN b.target_function = '' THEN 1 ELSE 2 END AS priority
+            FROM ai.skill_binding AS b
+            WHERE b.target_schema = v_target_schema
+              AND b.target_function IN ('', v_name_parts[cardinality(v_name_parts)])
+            UNION ALL
+            SELECT 'supabase-postgres-best-practices', 1, 0
+        ) AS s
+        ORDER BY s.skill_name, s.priority DESC
     ));
     v_profile := ai._get_model_profile(NULL);
+    IF v_catalog_mode NOT IN ('focused', 'full') THEN
+        RAISE EXCEPTION 'Unknown ai.function_catalog_mode: %. Use focused or full.', v_catalog_mode;
+    END IF;
+    v_full_catalog_bytes := octet_length(v_catalog::text);
+    IF v_catalog_mode = 'focused' THEN
+        v_catalog := ai._select_function_catalog(v_catalog, p_description, v_skills);
+    END IF;
 
-    v_payload := ai._complete(v_profile, jsonb_build_array(
+    v_messages := jsonb_build_array(
         jsonb_build_object('role', 'system', 'content', $prompt$
 Draft a PostgreSQL read-only SQL function. Return only a JSON object:
 {"arguments":[{"name":"p_example","schema":"public","relation":"example","column":"example_id"}],
- "return_type":"numeric","return_columns":[],"body":"SELECT ...","assumptions":["..."]}
+ "return_type":"numeric","return_columns":[],"report_contract":null,"body":"SELECT ...","assumptions":["..."]}
+For an analytical report (aggregate, ranked or grouped result), plan the report_contract before
+writing the body. Use this shape, with concise SQL expressions or descriptions:
+{"measure":"SUM(source.amount)","date_column":"schema.table.paid_at",
+ "filters":["paid_at >= start","paid_at < end"],"group_by":["product_id","month of paid_at"],
+ "output":["product_name","total_amount"],"order_by":["total_amount DESC"]}.
+Use null date_column when no date is involved and empty arrays for unused filters, grouping or
+ordering. Keep grouping dimensions even when they are absent from the output list.
+For a non-report function set report_contract to null. Write the body to implement the contract.
 Use the supplied catalog_snapshot as the source of truth for existing schemas, relations,
-columns, constraints, and types. It contains metadata from ai.catalog_snapshot.
-Apply the selected skills as domain rules. Their SQL examples illustrate how to use the catalog.
+columns, constraints, and types. It contains metadata from ai.catalog_snapshot and may be
+a subset selected for this task.
+Apply the selected PostgreSQL and domain skills. Their SQL examples illustrate how to use the catalog.
 Choose relevant objects from that snapshot before writing SQL. Do not invent database objects
 or add catalog-discovery queries. The target schema names where the function will be created;
 source tables can belong to other schemas represented in the snapshot.
@@ -622,13 +929,39 @@ $prompt$),
                 'catalog_snapshot', v_catalog, 'skills', v_skills)::text ||
             E'\nHonor both the grouping and the output columns in the description. ' ||
             'If a period is named for grouping but omitted from the output list, use it in GROUP BY without selecting it.')
-    ));
+    );
+    v_payload := ai._complete(v_profile, v_messages);
+    v_generator_usage := v_payload->'usage';
     v_draft := (v_payload #>> '{choices,0,message,content}')::jsonb;
     IF jsonb_typeof(v_draft->'arguments') IS DISTINCT FROM 'array'
        OR jsonb_typeof(v_draft->'return_columns') IS DISTINCT FROM 'array'
        OR jsonb_typeof(v_draft->'body') IS DISTINCT FROM 'string'
        OR jsonb_typeof(v_draft->'assumptions') IS DISTINCT FROM 'array' THEN
         RAISE EXCEPTION 'Model response is missing function draft fields';
+    END IF;
+
+    IF jsonb_typeof(v_draft->'report_contract') IS DISTINCT FROM 'null' THEN
+        v_report_contract := v_draft->'report_contract';
+        IF jsonb_typeof(v_report_contract) IS DISTINCT FROM 'object'
+           OR jsonb_typeof(v_report_contract->'measure') IS DISTINCT FROM 'string'
+           OR btrim(v_report_contract->>'measure') = ''
+           OR coalesce(jsonb_typeof(v_report_contract->'date_column'), '') NOT IN ('string', 'null')
+           OR btrim(v_report_contract->>'date_column') = ''
+           OR EXISTS (
+               SELECT 1
+               FROM unnest(ARRAY['filters', 'group_by', 'output', 'order_by']) AS k(key)
+               WHERE jsonb_typeof(v_report_contract->k.key) IS DISTINCT FROM 'array'
+           ) THEN
+            RAISE EXCEPTION 'Invalid report contract';
+        END IF;
+        IF jsonb_array_length(v_report_contract->'output') = 0 OR EXISTS (
+            SELECT 1
+            FROM unnest(ARRAY['filters', 'group_by', 'output', 'order_by']) AS k(key)
+            CROSS JOIN LATERAL jsonb_array_elements(v_report_contract->k.key) AS item(value)
+            WHERE jsonb_typeof(item.value) <> 'string' OR btrim(item.value #>> '{}') = ''
+        ) THEN
+            RAISE EXCEPTION 'Report contract requires output and nonempty text entries';
+        END IF;
     END IF;
 
     FOR v_argument IN SELECT value FROM jsonb_array_elements(v_draft->'arguments') LOOP
@@ -702,9 +1035,30 @@ $prompt$),
         'CREATE FUNCTION %s LANGUAGE sql SECURITY INVOKER SET search_path = pg_catalog AS %L;',
         signature, v_body
     );
-    EXECUTE ddl;
     assumptions := v_draft->'assumptions';
+    v_review := ai._review_function(jsonb_build_object(
+        'description', p_description, 'signature', signature, 'ddl', ddl,
+        'assumptions', assumptions, 'catalog_snapshot', v_catalog, 'skills', v_skills,
+        'report_contract', v_report_contract), NULL);
+    IF v_review->>'verdict' <> 'pass' THEN
+        RAISE EXCEPTION 'Function review: %', v_review->>'verdict' USING DETAIL = v_review::text;
+    END IF;
+    EXECUTE ddl;
     applied_skills := ARRAY(SELECT value->>'ref' FROM jsonb_array_elements(v_skills));
+    INSERT INTO ai.function_generation (
+        target_schema, function_name, description, signature, ddl, assumptions, generator_profile,
+        generator_model, generator_prompt_sha256, catalog_sha256, applied_skills, review, report_contract,
+        catalog_selection
+    ) VALUES (
+        v_target_schema, v_name_parts[cardinality(v_name_parts)], p_description, signature, ddl,
+        assumptions, v_profile.profile, coalesce(v_payload->>'model', v_profile.model),
+        encode(sha256(convert_to(v_messages #>> '{0,content}', 'UTF8')), 'hex'),
+        encode(sha256(convert_to(v_catalog::text, 'UTF8')), 'hex'), applied_skills, v_review, v_report_contract,
+        jsonb_build_object('mode', v_catalog_mode, 'full_bytes', v_full_catalog_bytes,
+            'selected_bytes', octet_length(v_catalog::text),
+            'prompt_tokens', v_generator_usage->'prompt_tokens',
+            'elapsed_ms', round(extract(epoch FROM clock_timestamp() - v_generation_started) * 1000))
+    );
     RETURN NEXT;
 END;
 $function$;
@@ -847,6 +1201,9 @@ REVOKE ALL ON FUNCTION ai.register_model_profile(text, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION ai._complete(ai.model_profile, jsonb) FROM PUBLIC;
 REVOKE ALL ON FUNCTION ai.init_catalog(text, jsonb, integer, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION ai.make_func(text, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION ai._select_function_catalog(jsonb, text, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION ai._review_function(jsonb, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION ai.review_function(regprocedure, text, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION ai.llm(text, text, text, jsonb, text[]) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.llm(text, text, text, jsonb, text[]) FROM PUBLIC;
 COMMIT;

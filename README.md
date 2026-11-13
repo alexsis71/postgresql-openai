@@ -88,6 +88,67 @@ SELECT * FROM ai.make_func(
 
 Пример проверки созданной функции приведён в [сценарии демобазы](examples/dvd_rent/README.md).
 
+Историю успешно созданных функций можно посмотреть в `ai.function_generation`.
+
+```sql
+SELECT created_at, signature, generator_model, catalog_sha256,
+       applied_skills, review->>'verdict' AS verdict
+FROM ai.function_generation
+WHERE target_schema = 'reporting'
+ORDER BY id DESC;
+```
+
+У отчётных функций в `ai.function_generation.report_contract` сохраняются мера, поле даты,
+фильтры, группировка, выходные столбцы и сортировка. Ревьюер сверяет контракт с заданием
+и проверяет, что SQL реализует его.
+
+```sql
+SELECT signature, report_contract
+FROM ai.function_generation
+WHERE report_contract IS NOT NULL
+ORDER BY id DESC;
+```
+
+По умолчанию `make_func` использует полный снимок. Чтобы передать только подобранные
+объекты и их ближайшие связи, включите `SET ai.function_catalog_mode = 'focused'`.
+Вернуться к полному снимку можно через `RESET ai.function_catalog_mode`.
+В `ai.function_generation.catalog_selection` сохраняются режим, размер исходного
+и переданного снимка, входные токены генератора и время создания с учётом ревью.
+
+### Ревью функций
+
+`make_func` перед созданием запрашивает отдельное LLM-ревью с навыком `review-function@1`.
+При вердикте `needs_changes` или `ambiguous` функция не создаётся, а пояснения возвращаются
+в `DETAIL` ошибки. Для ревью можно выбрать зарегистрированный профиль через
+`SET ai.reviewer_profile = 'review-model'`. Если настройка пуста, применяется текущий профиль модели.
+
+Для уже созданного объекта передайте его точную сигнатуру и описание ожидаемого поведения.
+Явный аргумент `p_profile` имеет приоритет над настройкой сессии.
+
+```sql
+SELECT ai.review_function(
+    'reporting.row_count()',
+    'Верни число строк в public.your_table. Входных параметров нет.'
+);
+```
+
+В чате можно выбрать `p_skills => ARRAY['review-function@1']` и приложить SQL функции к вопросу.
+Вердикт оценивает соответствие определения заданию. Проверку результата на данных выполняют отдельно.
+
+Если ожидаемое поведение неизвестно, передайте только сигнатуру:
+
+```sql
+SELECT jsonb_pretty(ai.review_function('public.my_function(integer)'));
+```
+
+`logic` описывает фактическое поведение, включая порядок шагов, ветвления, возвраты,
+операции с данными и то, что нельзя вывести из определения. В `findings` входят
+фрагмент, причина и уверенность (`high` или `medium`). Снимок используется при наличии.
+Ревьюер читает код SQL и PL/pgSQL из PostgreSQL без выполнения функции. Если модель вернула
+объяснение в неверном формате, PostgreSQL повторяет запрос один раз и проверяет ответ снова.
+Язык объяснения и замечаний определяется по описанию задания, комментариям к функции
+или описаниям связанных объектов. Для кода без явных языковых признаков используется английский.
+
 ## Чат с моделью
 
 `llm(<system prompt>, <user_prompt>)` — общий доступ к модели из SQL. Если новый вопрос
@@ -160,3 +221,14 @@ FROM ai.llm(
 Навыки хранятся отдельно от снимков и доступны по паре `name, version`. Пример предметного навыка и его подключения есть в [сценарии демобазы](examples/dvd_rent/README.md).
 
 `make_func(имя, описание)` сама загружает навыки из `ai.skill_binding` и возвращает их в `applied_skills`. Пустой `target_function` задаёт привязку ко всей схеме. Если один навык привязан и к схеме, и к имени функции, действует версия из привязки к функции.
+
+Установщик регистрирует `supabase-postgres-best-practices@1`, краткую адаптацию [рекомендаций Supabase для PostgreSQL](https://github.com/supabase/agent-skills/tree/c9be0e931b7930f7d02126d04774d904c381e7d7/skills/supabase-postgres-best-practices). `ai.make_func` передаёт её модели при генерации и ревью черновика, а `ai.review_function` — при ревью существующей функции. Привязка к схеме или функции может выбрать другую версию навыка. В чате навык выбирается явно и доступен без снимка схемы.
+
+```sql
+SELECT answer, applied_skills
+FROM ai.llm(
+    'Отвечай по-русски.',
+    'Как написать фильтр за календарный месяц по колонке timestamp?',
+    p_skills => ARRAY['supabase-postgres-best-practices@1']
+);
+```
