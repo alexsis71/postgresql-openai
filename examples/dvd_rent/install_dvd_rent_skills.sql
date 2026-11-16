@@ -35,10 +35,33 @@ $sql$)
 )
 ON CONFLICT (name, version) DO NOTHING;
 
+INSERT INTO ai.skill (name, version, description, instructions, catalog_objects, sql_examples)
+VALUES (
+    'customer-similarity-cube', 1, 'Compare DVD rental customer profiles using the cube extension.',
+    $instructions$
+Use public.cube(double precision[]) to construct each point, then call
+public.cube_distance(public.cube, public.cube). Pass all coordinates in one array
+and use the same coordinate order on both sides. The constructor is not variadic.
+For this report the coordinates are customer.store_id, address.city_id, and the distinct
+counts of rented film IDs, category IDs, and actor IDs. Follow rental → inventory → film,
+and use film_category and film_actor for the respective counts. Start from customer,
+keep customers without rentals, and use zero for their three rental counts.
+Use the store and city IDs as given. Compare the target profile to every other customer,
+exclude the target itself, and apply the result limit after ordering by distance.
+$instructions$,
+    ARRAY['public.customer', 'public.address', 'public.rental', 'public.inventory',
+          'public.film', 'public.film_category', 'public.film_actor'],
+    jsonb_build_array(jsonb_build_object('name', 'five-coordinate-distance', 'sql',
+        'SELECT public.cube_distance(public.cube(ARRAY[1, 2, 3, 4, 5]::double precision[]),
+                                     public.cube(ARRAY[1, 2, 3, 4, 6]::double precision[]))'))
+)
+ON CONFLICT (name, version) DO NOTHING;
+
 INSERT INTO ai.skill_binding (target_schema, target_function, skill_name, skill_version)
 VALUES
     ('reporting', 'film_box_office', 'rental-revenue', 1),
     ('reporting', 'monthly_film_revenue', 'rental-revenue', 1),
+    ('reporting', 'customer_like', 'customer-similarity-cube', 1),
     ('reporting', 'customer_revenue', 'rental-revenue', 1),
     ('public', 'customer_revenue', 'rental-revenue', 1)
 ON CONFLICT (target_schema, target_function, skill_name) DO NOTHING;

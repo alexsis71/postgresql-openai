@@ -27,6 +27,10 @@ Get-Content -Raw .\examples\dvd_rent\install_dvd_rent_skills.sql | docker exec -
 
 - [inspect_catalog.sql](inspect_catalog.sql) читает снимок `public`, типы и ограничения таблицы платежей.
 - [install_dvd_rent_skills.sql](install_dvd_rent_skills.sql) добавляет `rental-revenue@1` с правилами выручки и привязками к функциям.
+- Тот же скрипт привязывает `customer-similarity-cube@1` к `reporting.customer_like`.
+  Для этого примера нужны расширение `cube` в схеме `public` и снимок, снятый после установки расширения.
+  Навык показывает, как передать пять координат в `public.cube(double precision[])`
+  и сравнить две точки через `public.cube_distance`.
 - [make_func_customer_revenue.sql](make_func_customer_revenue.sql) создаёт `reporting.customer_revenue`.
 - [customer_revenue_baseline.sql](customer_revenue_baseline.sql) возвращает эталонные суммы для двух периодов.
 
