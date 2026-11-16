@@ -51,6 +51,37 @@ SELECT answer, profile FROM ai.llm(NULL, 'Что делает VACUUM?');
 
 `max_context_length` ограничивает размер сериализованного массива сообщений в байтах. Один и тот же лимит применяется к чату, инициализации каталога и генерации функций. `max_tokens` ограничивает ответ модели. Если в параметрах профиля есть `max_completion_tokens`, используется он.
 
+### Поиск по документации PostgreSQL 17
+
+После установки `sql/install_catalog.sql` загрузите выбранные разделы из локального
+официального PDF. Импортёр хранит текст, ссылку на раздел, выпуск PDF и номер страницы.
+Повторный импорт заменяет корпус PostgreSQL 17 одной транзакцией.
+
+```powershell
+python -m pip install pypdf "psycopg[binary]"
+python scripts/import_postgres17_docs.py postgresql-17-A4.pdf --dsn "host=localhost port=5432 dbname=mydb user=postgres"
+```
+
+`ai.make_func` и `ai.make_view` подбирают до четырёх выдержек для текущей основной версии
+сервера и передают их генератору и ревьюеру. Поиск использует полнотекстовый индекс,
+русские метки разделов и приоритет точных имён функций. При пустой выдаче вызов
+продолжается со снапшотом и навыками. В обоих генераторах
+`supabase-postgres-best-practices@1` подключён по умолчанию.
+
+```sql
+SELECT ai.search_postgres_docs('пересечение массивов unnest');
+SET ai.postgres_docs_rag = off;
+RESET ai.postgres_docs_rag;
+
+SELECT id, signature, documentation_sources
+FROM ai.function_generation
+ORDER BY id DESC
+LIMIT 5;
+```
+
+В `documentation_sources` сохраняются URL и координаты выдержек, переданных модели.
+Поле содержит пустой массив для старых записей и вызовов без выдержек.
+
 ### SQL-интерфейс
 
 ```sql
