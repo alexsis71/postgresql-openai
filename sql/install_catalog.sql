@@ -129,6 +129,80 @@ $best_practices$
 )
 ON CONFLICT (name, version) DO NOTHING;
 
+-- Справочник по расширению cube: собран по официальной документации PostgreSQL
+-- (глава "cube — type for representing multidimensional cubes") и проверен прогоном
+-- на этом сервере, cube 1.5. Навык не привязан к отношениям, поэтому catalog_objects
+-- остаётся пустым и requires_snapshot = false: cube — тип и функции, а не таблица.
+INSERT INTO ai.skill (name, version, description, instructions, sql_examples)
+VALUES (
+    'postgres-cube', 1, 'Use the cube extension: constructors, distance and containment operators, GiST ordering.',
+    $cube$
+Use cube only when the catalog routines contain public.cube and the functions you call; the
+extension is optional per database, so never invent these names. Constructors have fixed arity
+and are not variadic: public.cube(double precision) for one coordinate, public.cube(double
+precision, double precision) for a one-dimensional interval, public.cube(double precision[]) for
+a point in n dimensions, public.cube(double precision[], double precision[]) for a box from two
+opposite corners, and public.cube(cube, double precision[, double precision]) to append
+coordinates to an existing cube. Put every coordinate of a point in ONE array;
+public.cube(1.0, 2.0, 3.0) fails with "function public.cube(numeric, numeric, numeric) does not
+exist". There is no single-argument cube(cube) constructor: public.cube(<cube value>) parses as a
+cast to the cube type and silently returns the value unchanged. Integer and numeric arrays are
+coerced to double precision[] without an explicit cast. A cube literal such as
+'(1,2),(3,4)'::public.cube is equivalent input and ignores whitespace.
+Coordinates are stored as double precision: beyond about 16 significant digits they are rounded,
+and NULL in any argument yields NULL, which silently drops the row from a WHERE predicate. Cubes
+of different dimensionality do not raise an error either — the smaller one is padded with zeros,
+so public.cube_distance('(1,2)', '(3,4,5)') measures a three-dimensional distance. When
+dimensions carry meaning, require public.cube_dim to be equal on both sides before comparing.
+A cube holds at most 100 dimensions; an empty array gives a zero-dimension cube.
+Distances: public.cube_distance(a, b) and the operator a <-> b compute the same Euclidean
+distance, a <#> b the taxicab (L1) and a <=> b the Chebyshev (L-inf) distance, with
+public.distance_taxicab and public.distance_chebyshev as function forms. Containment and overlap
+use @>, <@ and &&. Read coordinates with a -> n (n-th coordinate) or a ~> n (odd n returns the
+lower bound of dimension (n + 1) / 2, even n the upper bound). Helpers: public.cube_dim,
+public.cube_ll_coord, public.cube_ur_coord, public.cube_coord, public.cube_coord_llur,
+public.cube_is_point, public.cube_size, public.cube_subset for projection and reordering,
+public.cube_union, public.cube_inter, public.cube_enlarge.
+Keep the coordinate order identical on both sides of every comparison and state the coordinate
+vector in the assumptions. For nearest-neighbour search use ORDER BY column <-> <cube> LIMIT k.
+GiST (opclass gist_cube_ops) accelerates && @> <@ = in WHERE and <-> <#> <=> ~> in ORDER BY;
+B-tree (cube_ops) only serves ordering and equality. Check pg_indexes for an existing index
+before relying on one, and describe performance without a plan as a hypothesis.
+$cube$,
+    jsonb_build_array(
+        jsonb_build_object('name', 'point-from-array-and-distance', 'sql', $sql$
+SELECT public.cube_dim(public.cube(ARRAY[1, 2, 3]::double precision[])) AS dimensions,
+       public.cube_distance('(1,2)'::public.cube, '(3,4)'::public.cube) AS euclidean_distance
+$sql$),
+        jsonb_build_object('name', 'nearest-neighbour-knn', 'sql', $sql$
+SELECT p.name
+FROM (VALUES
+    ('near', '(0.9,0.9)'::public.cube),
+    ('far',  '(9,9)'::public.cube),
+    ('mid',  '(3,3)'::public.cube)
+) AS p(name, c)
+ORDER BY p.c <-> public.cube(ARRAY[0.5, 0.5]::double precision[])
+LIMIT 2
+$sql$),
+        jsonb_build_object('name', 'containment-overlap-and-coordinate', 'sql', $sql$
+SELECT '(0,0),(1,1)'::public.cube @> '(0.5,0.5)'::public.cube AS contains_point,
+       '(0,0),(1,1)'::public.cube && '(0.5,0.5),(2,2)'::public.cube AS overlaps_box,
+       '(1,2),(3,4)'::public.cube ~> 3 AS second_dimension_lower_bound
+$sql$),
+        jsonb_build_object('name', 'projection-and-dimension-guard', 'sql', $sql$
+SELECT public.cube_subset(public.cube('(1,3,5),(6,7,8)'::public.cube), ARRAY[3, 1]) AS reordered,
+       public.cube_dim('(1,2)'::public.cube) = public.cube_dim('(3,4,5)'::public.cube)
+           AS same_dimensions
+$sql$),
+        jsonb_build_object('name', 'interval-and-its-bounds', 'sql', $sql$
+SELECT public.cube(1.5, 4.5) AS segment,
+       public.cube_ll_coord(public.cube(1.5, 4.5), 1) AS lower_bound,
+       public.cube_ur_coord(public.cube(1.5, 4.5), 1) AS upper_bound
+$sql$)
+    )
+)
+ON CONFLICT (name, version) DO NOTHING;
+
 DO $migration$
 BEGIN
     LOCK TABLE ai.catalog_snapshot IN ACCESS EXCLUSIVE MODE;

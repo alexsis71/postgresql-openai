@@ -57,11 +57,82 @@ $instructions$,
 )
 ON CONFLICT (name, version) DO NOTHING;
 
+INSERT INTO ai.skill (name, version, description, instructions, catalog_objects, sql_examples)
+VALUES (
+    'customer-similarity-binary-cube', 1, 'Euclidean customer similarity from binary cube profiles',
+    $instructions$
+Use the complete query in sql_examples as the template for this report. The baseline counts
+every occupied coordinate; for blocks occupied on both sides replace both counts with the
+rounded squared cube distance. This sums squared distances, including against the zero point
+for unmatched blocks. Sorting by the squared distance is equivalent to sorting by its square
+root. A customer with no rentals has zero occupied coordinates. Store means customer.store_id.
+Present the query body alone without SQL comments.
+$instructions$,
+    ARRAY['public.customer', 'public.address', 'public.rental', 'public.inventory',
+          'public.film', 'public.film_category', 'public.film_actor'],
+    jsonb_build_array(jsonb_build_object('name', 'customer-similarity', 'sql', $sql$
+WITH rented AS (
+    SELECT DISTINCT r.customer_id, i.film_id
+    FROM public.rental r JOIN public.inventory i USING (inventory_id)
+), description_ids AS (
+    SELECT DISTINCT description, dense_rank() OVER (ORDER BY description)::integer AS item_id
+    FROM public.film WHERE description IS NOT NULL
+), items AS (
+    SELECT customer_id, 'film' AS kind, film_id::integer AS item_id FROM rented
+    UNION ALL
+    SELECT DISTINCT r.customer_id, 'category', f.category_id::integer
+    FROM rented r JOIN public.film_category f USING (film_id)
+    UNION ALL
+    SELECT DISTINCT r.customer_id, 'actor', f.actor_id::integer
+    FROM rented r JOIN public.film_actor f USING (film_id)
+    UNION ALL
+    SELECT DISTINCT r.customer_id, 'description', d.item_id
+    FROM rented r JOIN public.film f USING (film_id)
+    JOIN description_ids d ON d.description = f.description
+), blocks AS (
+    SELECT customer_id, kind, (item_id - 1) / 100 AS block_id,
+           count(*) AS ones, array_agg((item_id - 1) % 100) AS slots
+    FROM items GROUP BY customer_id, kind, (item_id - 1) / 100
+), points AS (
+    SELECT b.customer_id, b.kind, b.block_id, b.ones, public.cube(ARRAY(
+        SELECT (s.slot = ANY(b.slots))::integer::double precision
+        FROM generate_series(0, 99) AS s(slot) ORDER BY s.slot
+    )) AS point FROM blocks b
+), totals AS (
+    SELECT customer_id, sum(ones) AS ones FROM blocks GROUP BY customer_id
+), adjustments AS (
+    SELECT b.customer_id,
+           sum(round(power(public.cube_distance(a.point, b.point), 2))::bigint - a.ones - b.ones) AS correction
+    FROM points a JOIN points b USING (kind, block_id)
+    WHERE a.customer_id = $1 AND b.customer_id <> $1
+    GROUP BY b.customer_id
+), target AS (
+    SELECT c.customer_id, c.store_id, a.city_id
+    FROM public.customer c JOIN public.address a USING (address_id)
+    WHERE c.customer_id = $1
+)
+SELECT c.customer_id, (c.first_name || ' ' || c.last_name)::text AS full_name
+FROM target t CROSS JOIN public.customer c
+JOIN public.address a ON a.address_id = c.address_id
+LEFT JOIN totals ct ON ct.customer_id = c.customer_id
+LEFT JOIN totals tt ON tt.customer_id = t.customer_id
+LEFT JOIN adjustments j ON j.customer_id = c.customer_id
+WHERE c.customer_id <> t.customer_id
+ORDER BY coalesce(ct.ones, 0) + coalesce(tt.ones, 0) + coalesce(j.correction, 0)
+         + (a.city_id <> t.city_id)::integer + (c.store_id <> t.store_id)::integer,
+         c.customer_id
+LIMIT 10
+$sql$))
+)
+ON CONFLICT (name, version) DO NOTHING;
+
 INSERT INTO ai.skill_binding (target_schema, target_function, skill_name, skill_version)
 VALUES
     ('reporting', 'film_box_office', 'rental-revenue', 1),
     ('reporting', 'monthly_film_revenue', 'rental-revenue', 1),
     ('reporting', 'customer_like', 'customer-similarity-cube', 1),
+    ('reporting', 'customer_like_v4', 'customer-similarity-binary-cube', 1),
+    ('reporting', 'customer_like_v4', 'postgres-cube', 1),
     ('reporting', 'customer_revenue', 'rental-revenue', 1),
     ('public', 'customer_revenue', 'rental-revenue', 1)
 ON CONFLICT (target_schema, target_function, skill_name) DO NOTHING;
