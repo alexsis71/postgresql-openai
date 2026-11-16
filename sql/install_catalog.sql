@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS ai.model_profile (
 
 ALTER TABLE ai.model_profile
     ADD COLUMN IF NOT EXISTS max_context_length integer NOT NULL DEFAULT 250000
-        CHECK (max_context_length BETWEEN 1000 AND 10000000);
+        CHECK (max_context_length BETWEEN 1000 AND 10000000),
+    ADD COLUMN IF NOT EXISTS compact_review_json_schema boolean NOT NULL DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS ai.catalog_snapshot (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -595,9 +596,33 @@ DECLARE
     v_explain boolean := coalesce(p_context->>'mode' = 'explain', false);
     v_messages jsonb;
     v_problem text;
+    v_compact_schema constant jsonb := '{
+        "type":"object", "additionalProperties":false, "required":["verdict","findings"],
+        "properties":{
+            "verdict":{"type":"string","enum":["pass","needs_changes","ambiguous"]},
+            "findings":{"type":"array","maxItems":3,"items":{
+                "type":"object","additionalProperties":false,
+                "required":["requirement","sql_fragment","reason"],
+                "properties":{
+                    "requirement":{"type":"string","minLength":1,"maxLength":120},
+                    "sql_fragment":{"type":"string","maxLength":180},
+                    "reason":{"type":"string","minLength":1,"maxLength":240}
+                }
+            }}
+        }
+    }';
 BEGIN
     v_profile := ai._get_model_profile(coalesce(p_profile,
         nullif(btrim(current_setting('ai.reviewer_profile', true)), '')));
+    IF NOT v_explain AND v_profile.compact_review_json_schema THEN
+        v_profile.request_options := v_profile.request_options || jsonb_build_object(
+            'response_format', jsonb_build_object(
+                'type', 'json_schema', 'json_schema', jsonb_build_object(
+                    'name', 'compact_sql_review', 'strict', true, 'schema', v_compact_schema
+                )
+            )
+        );
+    END IF;
     v_messages := jsonb_build_array(
         jsonb_build_object('role', 'system', 'content', $prompt$
 You are an independent PostgreSQL reviewer. Review the function or view in the request.
@@ -617,6 +642,8 @@ or {"verdict":"needs_changes","findings":[{"requirement":"...","sql_fragment":".
 or {"verdict":"ambiguous","findings":[{"requirement":"...","sql_fragment":"...","reason":"Question to resolve"}]}
 Use an empty SQL fragment for a missing expression. Each reason must be a short explanation
 of the final finding, in the language of the description.
+Select at most three blocking findings. Write complete sentences. Limits in characters:
+requirement 120, sql_fragment 180, reason 240. Quote only the relevant part of the SQL.
 $gate$ ELSE $explain$
 
 Explain the actual behavior before evaluating it, including PL/pgSQL control flow.
@@ -656,7 +683,8 @@ $explain$ END),
             v_review := NULL;
         END;
         v_problem := NULL;
-        IF v_review->>'verdict' IS NULL OR v_review->>'verdict' NOT IN ('pass', 'needs_changes', 'ambiguous')
+        IF jsonb_typeof(v_review) IS DISTINCT FROM 'object'
+           OR v_review->>'verdict' IS NULL OR v_review->>'verdict' NOT IN ('pass', 'needs_changes', 'ambiguous')
            OR jsonb_typeof(v_review->'findings') IS DISTINCT FROM 'array' THEN
             v_problem := 'Invalid function review response';
         ELSIF (v_review->>'verdict' = 'pass') <> (jsonb_array_length(v_review->'findings') = 0)
@@ -679,6 +707,19 @@ $explain$ END),
             )
         ) THEN
             v_problem := 'Function review did not return a structured explanation';
+        ELSIF NOT v_explain AND (
+            v_review - ARRAY['verdict', 'findings'] <> '{}'::jsonb
+            OR jsonb_array_length(v_review->'findings') > 3
+            OR EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements(v_review->'findings') AS f(value)
+                WHERE f.value - ARRAY['requirement', 'sql_fragment', 'reason'] <> '{}'::jsonb
+                   OR char_length(f.value->>'requirement') > 120
+                   OR char_length(f.value->>'sql_fragment') > 180
+                   OR char_length(f.value->>'reason') > 240
+            )
+        ) THEN
+            v_problem := 'Function review exceeds the compact response format';
         END IF;
         IF v_problem IS NULL THEN
             RETURN v_review || jsonb_build_object('profile', v_profile.profile,
