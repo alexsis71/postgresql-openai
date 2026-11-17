@@ -133,6 +133,35 @@ FROM ai.llm(NULL, 'Как проверить, почему планировщи�
 к схеме или имени объекта. Оценка производительности использует измерения из
 плана, если он предоставлен.
 
+#### Автоматический разбор плана
+
+`ai.optimize_query` принимает один `SELECT`, включая запрос с CTE, и возвращает
+план PostgreSQL в JSON, рекомендации модели, применённые навыки и ссылки на
+документацию. Параметры `p_goal` и `p_profile` необязательны.
+
+```sql
+BEGIN READ ONLY;
+SET LOCAL statement_timeout = '90s';
+SET LOCAL lock_timeout = '2s';
+
+SELECT plan, advice, applied_skills, documentation_sources
+FROM ai.optimize_query(
+    $$SELECT customer_id, sum(amount)
+      FROM public.payment
+      WHERE payment_date::date = DATE '2007-02-15'
+      GROUP BY customer_id$$,
+    p_goal => 'Оцени фильтр по дате и предложи эквивалентный диапазон'
+);
+COMMIT;
+```
+
+План строится с правами и `search_path` вызывающей роли. PostgreSQL планирует
+запрос как подзапрос через `EXPLAIN (FORMAT JSON, COSTS TRUE, VERBOSE TRUE, SETTINGS TRUE, ANALYZE FALSE)`.
+План содержит оценки строк и стоимости. Фактические времена и буферы требуют отдельного замера.
+SQL и план отправляются в выбранный профиль модели. Используйте профиль, которому можно
+передать идентификаторы объектов, условия и литералы этого запроса. Рекомендации возвращаются
+текстом, изменения SQL или индексов выполняет разработчик.
+
 ### SQL-интерфейс
 
 ```sql
