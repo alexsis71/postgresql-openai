@@ -22,6 +22,49 @@ ALTER TABLE ai.model_profile
         CHECK (max_context_length BETWEEN 1000 AND 10000000),
     ADD COLUMN IF NOT EXISTS compact_review_json_schema boolean NOT NULL DEFAULT false;
 
+CREATE TABLE IF NOT EXISTS ai.conversation (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    owner_name name NOT NULL DEFAULT CURRENT_USER,
+    title text,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    turn_count bigint NOT NULL DEFAULT 0 CHECK (turn_count >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS conversation_owner_updated_idx
+    ON ai.conversation (owner_name, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS ai.message (
+    conversation_id uuid NOT NULL REFERENCES ai.conversation (id) ON DELETE CASCADE,
+    position bigint NOT NULL CHECK (position > 0),
+    role text NOT NULL CHECK (role IN ('user', 'assistant')),
+    content text NOT NULL CHECK (btrim(content) <> ''),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (conversation_id, position)
+);
+
+ALTER TABLE ai.conversation ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ai.conversation FORCE ROW LEVEL SECURITY;
+ALTER TABLE ai.message ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ai.message FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS conversation_owner_access ON ai.conversation;
+CREATE POLICY conversation_owner_access ON ai.conversation
+    USING (owner_name = CURRENT_USER) WITH CHECK (owner_name = CURRENT_USER);
+
+DROP POLICY IF EXISTS message_owner_access ON ai.message;
+CREATE POLICY message_owner_access ON ai.message
+    USING (EXISTS (
+        SELECT 1 FROM ai.conversation AS c
+        WHERE c.id = message.conversation_id AND c.owner_name = CURRENT_USER
+    ))
+    WITH CHECK (EXISTS (
+        SELECT 1 FROM ai.conversation AS c
+        WHERE c.id = message.conversation_id AND c.owner_name = CURRENT_USER
+    ));
+
+REVOKE ALL ON TABLE ai.conversation, ai.message FROM PUBLIC;
+
 CREATE TABLE IF NOT EXISTS ai.catalog_snapshot (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     captured_at timestamptz NOT NULL,
@@ -1729,6 +1772,77 @@ $prompt$);
 END;
 $function$;
 
+CREATE OR REPLACE FUNCTION ai.create_conversation(p_title text DEFAULT NULL)
+RETURNS uuid
+LANGUAGE sql
+SECURITY INVOKER
+SET search_path = pg_catalog
+AS $function$
+    INSERT INTO ai.conversation (title) VALUES (nullif(btrim(p_title), '')) RETURNING id;
+$function$;
+
+CREATE OR REPLACE FUNCTION ai.chat(
+    p_conversation_id uuid,
+    p_user text,
+    p_system text DEFAULT NULL,
+    p_profile text DEFAULT NULL,
+    p_skills text[] DEFAULT '{}'
+) RETURNS TABLE (
+    answer text,
+    model text,
+    profile text,
+    finish_reason text,
+    prompt_tokens integer,
+    completion_tokens integer,
+    total_tokens integer,
+    latency_ms integer,
+    applied_skills text[],
+    turn_number bigint
+)
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_turn bigint;
+    v_history jsonb;
+    v_response record;
+BEGIN
+    IF nullif(btrim(p_user), '') IS NULL THEN
+        RAISE EXCEPTION 'Provide a user prompt';
+    END IF;
+
+    -- Serialize turns in this conversation before reading the context.
+    UPDATE ai.conversation AS c
+    SET turn_count = c.turn_count + 1
+    WHERE c.id = p_conversation_id AND c.owner_name = CURRENT_USER
+    RETURNING c.turn_count INTO v_turn;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Conversation does not exist or is inaccessible' USING ERRCODE = '42501';
+    END IF;
+
+    SELECT coalesce(jsonb_agg(jsonb_build_object('role', m.role, 'content', m.content)
+                              ORDER BY m.position), '[]'::jsonb)
+    INTO v_history
+    FROM ai.message AS m
+    WHERE m.conversation_id = p_conversation_id;
+
+    SELECT * INTO STRICT v_response
+    FROM ai.llm(p_system, p_user, p_profile, v_history, p_skills);
+
+    INSERT INTO ai.message (conversation_id, position, role, content)
+    VALUES (p_conversation_id, 2 * v_turn - 1, 'user', p_user),
+           (p_conversation_id, 2 * v_turn, 'assistant', v_response.answer);
+
+    UPDATE ai.conversation AS c SET updated_at = clock_timestamp()
+    WHERE c.id = p_conversation_id;
+
+    RETURN QUERY SELECT v_response.answer, v_response.model, v_response.profile,
+        v_response.finish_reason, v_response.prompt_tokens, v_response.completion_tokens,
+        v_response.total_tokens, v_response.latency_ms, v_response.applied_skills, v_turn;
+END;
+$function$;
+
 CREATE OR REPLACE FUNCTION public.llm(
     p_system text,
     p_user text,
@@ -1767,5 +1881,7 @@ REVOKE ALL ON FUNCTION ai._select_function_catalog(jsonb, text, jsonb) FROM PUBL
 REVOKE ALL ON FUNCTION ai._review_function(jsonb, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION ai.review_function(regprocedure, text, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION ai.llm(text, text, text, jsonb, text[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION ai.create_conversation(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION ai.chat(uuid, text, text, text, text[]) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.llm(text, text, text, jsonb, text[]) FROM PUBLIC;
 COMMIT;

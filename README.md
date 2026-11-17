@@ -344,6 +344,47 @@ GRANT EXECUTE ON FUNCTION public.llm(text, text, text, jsonb, text[]) TO app_use
 
 Функции работают с правами вызывающего. При настройке роли отдельно учитывайте доступ к профилям, снимкам, навыкам и внутренним функциям. После обновления со старой сигнатуры проверьте явные права на `llm` и `make_func`.
 
+### Чат с сохранением истории
+
+`ai.create_conversation` создаёт диалог и возвращает UUID. `ai.chat` подставляет
+сохранённые сообщения в вызов `ai.llm`, затем записывает вопрос и ответ одной
+транзакцией. При ошибке модели ход можно повторить с тем же UUID.
+
+```sql
+SELECT ai.create_conversation('Знакомство с dvd_rent') AS conversation_id \gset
+
+SELECT answer, turn_number
+FROM ai.chat(:'conversation_id'::uuid, 'Как устроена таблица public.payment?');
+
+SELECT answer, turn_number
+FROM ai.chat(:'conversation_id'::uuid, 'Какой внешний ключ ты упомянул?');
+
+SELECT position, role, content
+FROM ai.message
+WHERE conversation_id = :'conversation_id'::uuid
+ORDER BY position;
+```
+
+`\gset` сохраняет UUID в переменную `psql`. В других клиентах передайте UUID из
+первого запроса как параметр. Для каждого хода можно указать `p_system`,
+`p_profile` и `p_skills`. В контекст входит вся история диалога в пределах
+лимита выбранного профиля. Вызовы `ai.llm` с клиентским `p_history` работают
+по прежнему интерфейсу.
+
+RLS ограничивает чтение и запись владельцем диалога по `CURRENT_USER`. Роль
+PostgreSQL служит идентификатором владельца. Клиенты, подключённые под одной ролью,
+используют общий набор диалогов. Долгие транзакции задерживают следующий ход того
+же диалога, поэтому завершайте транзакцию после получения ответа.
+
+Для роли с уже настроенным доступом к `ai.llm` нужны дополнительные права:
+
+```sql
+GRANT EXECUTE ON FUNCTION ai.create_conversation(text), ai.chat(uuid, text, text, text, text[]) TO app_user;
+GRANT SELECT ON ai.conversation, ai.message TO app_user;
+GRANT INSERT (title), UPDATE (turn_count, updated_at) ON ai.conversation TO app_user;
+GRANT INSERT (conversation_id, position, role, content) ON ai.message TO app_user;
+```
+
 Каждый вызов `llm` — обращение к модели, а не обычный `SELECT`. Готовые запросы — в
 [examples/llm_chat.sql](examples/llm_chat.sql).
 
