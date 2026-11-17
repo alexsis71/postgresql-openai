@@ -101,12 +101,24 @@ CREATE TABLE IF NOT EXISTS ai.postgres_doc_chunk (
 CREATE INDEX IF NOT EXISTS postgres_doc_chunk_search_idx
     ON ai.postgres_doc_chunk USING gin (search_vector);
 
+ALTER TABLE ai.postgres_doc_chunk
+    ADD COLUMN IF NOT EXISTS source_kind text NOT NULL DEFAULT 'manual',
+    ADD COLUMN IF NOT EXISTS embedding_model text,
+    ADD COLUMN IF NOT EXISTS embedding real[];
+
+CREATE TABLE IF NOT EXISTS ai.doc_embedding_profile (
+    profile text PRIMARY KEY CHECK (profile = 'default'),
+    endpoint text NOT NULL CHECK (endpoint ~ '^https?://'),
+    model text NOT NULL CHECK (btrim(model) <> ''),
+    dimensions integer NOT NULL CHECK (dimensions BETWEEN 1 AND 4096)
+);
+
 -- Roles with USAGE on ai can retrieve public upstream documentation without
 -- access to the corpus table.
-CREATE OR REPLACE FUNCTION ai.search_postgres_docs(p_query text)
+CREATE OR REPLACE FUNCTION ai._rank_postgres_docs(p_query text, p_embedding real[], p_model text)
 RETURNS jsonb
-LANGUAGE sql STABLE SECURITY DEFINER
-SET search_path = pg_catalog, pg_temp
+LANGUAGE sql STABLE
+SET search_path = pg_catalog
 AS $function$
     WITH terms AS (
         SELECT to_tsquery('pg_catalog.simple', string_agg(quote_literal(term), ' | ')) AS query
@@ -130,8 +142,9 @@ AS $function$
         ) AS score
         FROM matching AS d
         WHERE d.topic_match OR NOT EXISTS (SELECT 1 FROM matching WHERE topic_match)
-    ), selected AS (
-        SELECT *
+    ), lexical AS (
+        SELECT section_url, page_number, chunk_number,
+               row_number() OVER (ORDER BY score DESC, section_url) AS rank
         FROM (
             SELECT ranked.*, row_number() OVER (
                 PARTITION BY section_url ORDER BY score DESC, page_number, chunk_number
@@ -140,13 +153,108 @@ AS $function$
         ) AS candidates
         WHERE section_rank = 1
         ORDER BY score DESC, section_url
+        LIMIT 12
+    ), distances AS (
+        SELECT d.section_url, d.page_number, d.chunk_number, similarity.score
+        FROM ai.postgres_doc_chunk AS d
+        CROSS JOIN LATERAL (
+            SELECT sum(x::double precision * y)
+                / nullif(sqrt(sum(x::double precision * x) * sum(y::double precision * y)), 0) AS score
+            FROM unnest(d.embedding, p_embedding) AS v(x, y)
+        ) AS similarity
+        WHERE p_embedding IS NOT NULL
+          AND d.server_major = current_setting('server_version_num')::integer / 10000
+          AND d.embedding_model = p_model AND cardinality(d.embedding) = cardinality(p_embedding)
+          AND similarity.score IS NOT NULL
+    ), semantic AS (
+        SELECT section_url, page_number, chunk_number,
+               row_number() OVER (ORDER BY score DESC, section_url) AS rank
+        FROM (
+            SELECT DISTINCT ON (section_url) section_url, page_number, chunk_number, score
+            FROM distances
+            ORDER BY section_url, score DESC, page_number, chunk_number
+        ) AS best
+        ORDER BY score DESC, section_url
+        LIMIT 12
+    ), selected AS (
+        SELECT coalesce(l.section_url, s.section_url) AS section_url,
+               coalesce(l.page_number, s.page_number) AS page_number,
+               coalesce(l.chunk_number, s.chunk_number) AS chunk_number,
+               l.rank AS lexical_rank, s.rank AS semantic_rank,
+               coalesce(1.0 / (10 + l.rank), 0) + coalesce(1.0 / (10 + s.rank), 0) AS score
+        FROM lexical AS l FULL JOIN semantic AS s USING (section_url)
+        ORDER BY score DESC, lexical_rank NULLS LAST, section_url
         LIMIT 4
     )
     SELECT coalesce(jsonb_agg(jsonb_build_object(
-        'url', section_url, 'title', title, 'pdf_edition', pdf_edition,
-        'page', page_number, 'chunk', chunk_number, 'excerpt', excerpt
-    ) ORDER BY score DESC, section_url), '[]'::jsonb)
-    FROM selected;
+        'url', d.section_url, 'title', d.title, 'pdf_edition', d.pdf_edition,
+        'page', d.page_number, 'chunk', d.chunk_number, 'excerpt', d.excerpt,
+        'source_kind', d.source_kind,
+        'search_mode', CASE WHEN p_embedding IS NULL THEN 'fts' ELSE 'hybrid' END,
+        'lexical_rank', s.lexical_rank, 'semantic_rank', s.semantic_rank
+    ) ORDER BY s.score DESC, s.lexical_rank NULLS LAST, d.section_url), '[]'::jsonb)
+    FROM selected AS s JOIN ai.postgres_doc_chunk AS d USING (section_url, page_number, chunk_number)
+    WHERE d.server_major = current_setting('server_version_num')::integer / 10000;
+$function$;
+
+REVOKE ALL ON FUNCTION ai._rank_postgres_docs(text, real[], text) FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION ai.search_postgres_docs(p_query text)
+RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $function$
+DECLARE
+    v_mode text := coalesce(nullif(current_setting('ai.postgres_docs_search', true), ''), 'fts');
+    v_profile ai.doc_embedding_profile%ROWTYPE;
+    v_response ai_http.http_response;
+    v_vector real[];
+    v_connect_timeout text;
+    v_timeout text;
+BEGIN
+    IF v_mode NOT IN ('fts', 'hybrid') THEN
+        RAISE EXCEPTION 'Unknown ai.postgres_docs_search: %. Use fts or hybrid.', v_mode;
+    END IF;
+    IF nullif(btrim(p_query), '') IS NULL THEN
+        RETURN '[]'::jsonb;
+    END IF;
+    IF v_mode = 'hybrid' THEN
+        SELECT * INTO v_profile FROM ai.doc_embedding_profile WHERE profile = 'default';
+        IF FOUND AND EXISTS (
+            SELECT 1 FROM ai.postgres_doc_chunk
+            WHERE server_major = current_setting('server_version_num')::integer / 10000
+              AND embedding_model = v_profile.model AND cardinality(embedding) = v_profile.dimensions
+        ) THEN
+            BEGIN
+                PERFORM ai_http.http_list_curlopt();
+                v_connect_timeout := current_setting('http.curlopt_connecttimeout_ms', true);
+                v_timeout := current_setting('http.curlopt_timeout_ms', true);
+                PERFORM set_config('http.curlopt_connecttimeout_ms', '1500', true);
+                PERFORM set_config('http.curlopt_timeout_ms', '5000', true);
+                SELECT * INTO v_response FROM ai_http.http_post(v_profile.endpoint,
+                    jsonb_build_object('model', v_profile.model, 'input', 'query: ' || p_query)::text,
+                    'application/json');
+                PERFORM set_config('http.curlopt_connecttimeout_ms', v_connect_timeout, true);
+                PERFORM set_config('http.curlopt_timeout_ms', v_timeout, true);
+                IF v_response.status BETWEEN 200 AND 299 THEN
+                    SELECT array_agg(value::real ORDER BY ordinal) INTO v_vector
+                    FROM jsonb_array_elements_text(v_response.content::jsonb #> '{data,0,embedding}')
+                        WITH ORDINALITY AS e(value, ordinal);
+                END IF;
+            EXCEPTION WHEN OTHERS THEN
+                v_vector := NULL;
+            END;
+        END IF;
+        IF cardinality(v_vector) IS DISTINCT FROM v_profile.dimensions OR v_vector IS NULL
+           OR EXISTS (SELECT 1 FROM unnest(v_vector) AS e(value)
+                      WHERE value IS NULL OR value IN ('NaN'::real, 'Infinity'::real, '-Infinity'::real))
+           OR NOT EXISTS (SELECT 1 FROM unnest(v_vector) AS e(value) WHERE value <> 0) THEN
+            RAISE NOTICE 'Hybrid documentation search fell back to FTS because embeddings were unavailable.';
+            v_vector := NULL;
+        END IF;
+    END IF;
+    RETURN ai._rank_postgres_docs(p_query, v_vector, v_profile.model);
+END;
 $function$;
 ALTER TABLE ai.function_generation
     ADD COLUMN IF NOT EXISTS object_kind text NOT NULL DEFAULT 'function'
@@ -1126,7 +1234,10 @@ BEGIN
     IF coalesce(nullif(current_setting('ai.postgres_docs_rag', true), '')::boolean, true) THEN
         v_documentation := ai.search_postgres_docs(p_description);
         IF v_documentation <> '[]'::jsonb THEN
-            v_doc_context := jsonb_build_object('postgres_documentation', v_documentation);
+            SELECT jsonb_build_object('postgres_documentation',
+                jsonb_agg(doc - ARRAY['source_kind', 'search_mode', 'lexical_rank', 'semantic_rank'] ORDER BY ordinal))
+            INTO v_doc_context
+            FROM jsonb_array_elements(v_documentation) WITH ORDINALITY AS d(doc, ordinal);
         END IF;
     END IF;
     v_messages := jsonb_build_array(
@@ -1367,7 +1478,10 @@ BEGIN
     IF coalesce(nullif(current_setting('ai.postgres_docs_rag', true), '')::boolean, true) THEN
         v_documentation := ai.search_postgres_docs(p_description);
         IF v_documentation <> '[]'::jsonb THEN
-            v_doc_context := jsonb_build_object('postgres_documentation', v_documentation);
+            SELECT jsonb_build_object('postgres_documentation',
+                jsonb_agg(doc - ARRAY['source_kind', 'search_mode', 'lexical_rank', 'semantic_rank'] ORDER BY ordinal))
+            INTO v_doc_context
+            FROM jsonb_array_elements(v_documentation) WITH ORDINALITY AS d(doc, ordinal);
         END IF;
     END IF;
     v_messages := jsonb_build_array(

@@ -80,7 +80,7 @@ def main():
         raise ValueError("The PDF extraction did not yield text for all selected sections")
     with psycopg.connect(args.dsn) as connection, connection.cursor() as cursor:
         cursor.execute("LOCK TABLE ai.postgres_doc_chunk IN SHARE ROW EXCLUSIVE MODE")
-        cursor.execute("DELETE FROM ai.postgres_doc_chunk WHERE server_major = 17")
+        cursor.execute("DELETE FROM ai.postgres_doc_chunk WHERE server_major = 17 AND source_kind = 'manual'")
         with cursor.copy("""
             COPY ai.postgres_doc_chunk
                 (server_major, section_url, title, pdf_edition, page_number, chunk_number, keywords, excerpt)

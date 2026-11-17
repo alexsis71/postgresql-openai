@@ -82,6 +82,57 @@ LIMIT 5;
 В `documentation_sources` сохраняются URL и координаты выдержек, переданных модели.
 Поле содержит пустой массив для старых записей и вызовов без выдержек.
 
+#### Гибридный поиск
+
+На хосте для эмбеддингов можно запустить CPU-сервис с моделью
+`intfloat/multilingual-e5-small`. Укажите адрес, доступный PostgreSQL и импортёру.
+
+```sh
+python -m pip install fastembed
+python scripts/serve_doc_embeddings.py --host 127.0.0.1 --port 8031
+```
+
+```sql
+INSERT INTO ai.doc_embedding_profile (profile, endpoint, model, dimensions)
+VALUES ('default', 'http://127.0.0.1:8031/v1/embeddings', 'intfloat/multilingual-e5-small', 384)
+ON CONFLICT (profile) DO UPDATE
+SET endpoint = EXCLUDED.endpoint, model = EXCLUDED.model, dimensions = EXCLUDED.dimensions;
+```
+
+```sh
+python scripts/embed_postgres_docs.py --dsn "host=localhost dbname=mydb user=postgres"
+```
+
+```sql
+SET ai.postgres_docs_search = 'hybrid';
+SELECT ai.search_postgres_docs('как найти общие элементы двух массивов');
+SET ai.postgres_docs_search = 'fts';
+```
+
+`fts` остаётся режимом по умолчанию. `hybrid` объединяет полнотекстовую и
+косинусную выдачу методом Reciprocal Rank Fusion (RRF). Для малого корпуса используется точный
+поиск по массивам PostgreSQL. При недоступном endpoint поиск возвращается к FTS
+с уведомлением. В истории доступны фактический `search_mode` и ранги источников.
+После повторного импорта запустите индексацию эмбеддингов для новых выдержек.
+
+#### Корпус оптимизации запросов
+
+`psql -f sql/install_query_optimization_corpus.sql` добавляет краткие конспекты
+по русскому изданию книги Г. Домбровской, Б. Новикова и А. Бейликовой, ссылки
+на страницы локального PDF и навык `postgres-query-optimization@1`.
+Полнотекстовый поиск доступен сразу. Для гибридного поиска обновите эмбеддинги
+тем же импортёром. Корпус документации и конспекты можно переустанавливать отдельно.
+
+```sql
+SELECT answer, applied_skills
+FROM ai.llm(NULL, 'Как проверить, почему планировщик выбрал Seq Scan?',
+    p_skills => ARRAY['postgres-query-optimization@1']);
+```
+
+Для `make_func` и `make_view` навык подключается через `ai.skill_binding`
+к схеме или имени объекта. Оценка производительности использует измерения из
+плана, если он предоставлен.
+
 ### SQL-интерфейс
 
 ```sql
