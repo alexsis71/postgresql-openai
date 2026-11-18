@@ -1,0 +1,7 @@
+comment = 'OpenAI-compatible models and SQL generation for PostgreSQL'
+default_version = '0.1.0'
+encoding = 'UTF8'
+schema = 'ai'
+relocatable = false
+requires = 'http'
+no_relocate = 'http'

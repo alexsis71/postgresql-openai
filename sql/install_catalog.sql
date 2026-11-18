@@ -1,10 +1,22 @@
 \set ON_ERROR_STOP on
 BEGIN;
 
+DO $installer$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'postgresql_openai') THEN
+        RAISE EXCEPTION 'postgresql_openai is managed by CREATE EXTENSION'
+            USING HINT = 'Use an extension update script when a newer version is available.';
+    END IF;
+END;
+$installer$;
+
 CREATE SCHEMA IF NOT EXISTS ai;
 CREATE SCHEMA IF NOT EXISTS ai_http;
 CREATE EXTENSION IF NOT EXISTS http WITH SCHEMA ai_http;
-REVOKE ALL ON SCHEMA ai, ai_http FROM PUBLIC;
+REVOKE ALL ON SCHEMA ai_http FROM PUBLIC;
+
+-- BEGIN SHARED INSTALL SQL
+REVOKE ALL ON SCHEMA ai FROM PUBLIC;
 
 CREATE TABLE IF NOT EXISTS ai.model_profile (
     profile text PRIMARY KEY,
@@ -423,6 +435,7 @@ $sql$)
 )
 ON CONFLICT (name, version) DO NOTHING;
 
+-- BEGIN LEGACY MIGRATION
 DO $migration$
 BEGIN
     LOCK TABLE ai.catalog_snapshot IN ACCESS EXCLUSIVE MODE;
@@ -473,6 +486,7 @@ BEGIN
 END;
 $migration$;
 
+-- END LEGACY MIGRATION
 CREATE OR REPLACE FUNCTION ai._skill_context(p_refs text[])
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -1884,4 +1898,5 @@ REVOKE ALL ON FUNCTION ai.llm(text, text, text, jsonb, text[]) FROM PUBLIC;
 REVOKE ALL ON FUNCTION ai.create_conversation(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION ai.chat(uuid, text, text, text, text[]) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.llm(text, text, text, jsonb, text[]) FROM PUBLIC;
+-- END SHARED INSTALL SQL
 COMMIT;

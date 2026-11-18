@@ -13,10 +13,9 @@ docker cp .\examples\dvd_rent\dvdrental.tar postgres1:/tmp/dvdrental.tar
 docker exec postgres1 sh -c 'createdb -U "${POSTGRES_USER:-postgres}" dvd_rent && pg_restore --exit-on-error --no-owner --no-privileges -U "${POSTGRES_USER:-postgres}" -d dvd_rent /tmp/dvdrental.tar'
 ```
 
-Установите общий SQL, затем создайте снимок и загрузите навык демобазы.
+Установите расширение в базу `dvd_rent` по [общей инструкции](../../README.md#установка-в-postgresql), затем создайте снимок и загрузите навыки демобазы. Для уже настроенной демобазы переходите сразу к этим двум командам.
 
 ```powershell
-Get-Content -Raw .\sql\install_catalog.sql | docker exec -i postgres1 sh -c 'psql -X -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d dvd_rent'
 Get-Content -Raw .\examples\dvd_rent\init_dvd_rent.sql | docker exec -i postgres1 sh -c 'psql -X -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d dvd_rent'
 Get-Content -Raw .\examples\dvd_rent\install_dvd_rent_skills.sql | docker exec -i postgres1 sh -c 'psql -X -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d dvd_rent'
 ```

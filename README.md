@@ -13,17 +13,33 @@
 | Файл | Назначение |
 | --- | --- |
 | [docs/design.md](docs/design.md) | Исходная постановка, устройство каталога и алгоритм `make_func` |
-| [sql/install_catalog.sql](sql/install_catalog.sql) | Установка и миграция каталога, `ai.init_catalog()`, `ai.make_func()` и `llm()` |
+| [scripts/build_extension.py](scripts/build_extension.py) | Сборка файлов для `CREATE EXTENSION postgresql_openai` |
+| [sql/install_catalog.sql](sql/install_catalog.sql) | Исходный SQL расширения и установщик для существующих скриптовых инсталляций |
 | [examples/llm_chat.sql](examples/llm_chat.sql) | Общие примеры чата с моделью и историей разговора |
 | [examples/dvd_rent](examples/dvd_rent/README.md) | Демобаза, настройка, навыки, примеры и эталоны |
 
 ## Установка в PostgreSQL
 
-Установите `pgsql-http` на сервер PostgreSQL. Для Debian с PGDG и PostgreSQL 17 пакет называется `postgresql-17-http`. Запустите установщик через `psql` под ролью, которая может создать расширение `http` и служебные схемы. Замените `your_database` на имя своей базы.
+На сервере PostgreSQL 17 установите `pgsql-http`. Для Debian с PGDG пакет называется `postgresql-17-http`. Соберите пакет из корня репозитория с помощью Python 3.10+ и скопируйте два файла в каталог расширений **сервера**. Используйте `pg_config` той же версии PostgreSQL, что и сервер. Для Docker файлы должны находиться внутри контейнера или в его образе.
 
 ```shell
-psql -X -v ON_ERROR_STOP=1 -d your_database -f sql/install_catalog.sql
+python3 scripts/build_extension.py build/extension
+sudo install -m 0644 build/extension/postgresql_openai.control \
+  build/extension/postgresql_openai--0.1.0.sql "$(pg_config --sharedir)/extension/"
 ```
+
+В целевой базе выполните под суперпользователем PostgreSQL:
+
+```sql
+CREATE SCHEMA ai_http;
+REVOKE ALL ON SCHEMA ai_http FROM PUBLIC;
+CREATE EXTENSION http WITH SCHEMA ai_http;
+CREATE EXTENSION postgresql_openai;
+```
+
+Если `http` уже установлен, достаточно последней команды. Расширение использует схему `ai`, а совместимая обёртка `llm` находится в `public`. Установка создаёт общие навыки. Профили моделей, снимки, корпус документации и данные демобазы подключаются отдельно.
+
+Для существующей установки через `sql/install_catalog.sql` продолжайте использовать этот скрипт. Версия 0.1.0 рассчитана на чистую установку; перевода существующих объектов под управление расширения пока нет. Удаление расширения удаляет и его служебные таблицы с данными.
 
 После установки зарегистрируйте модель и создайте снимок нужной схемы. HTTP-запросы выполняются с сервера PostgreSQL. При установке в Docker сетевую доступность endpoint проверяют из контейнера.
 
@@ -53,7 +69,7 @@ SELECT answer, profile FROM ai.llm(NULL, 'Что делает VACUUM?');
 
 ### Поиск по документации PostgreSQL 17
 
-После установки `sql/install_catalog.sql` загрузите выбранные разделы из локального
+После установки расширения загрузите выбранные разделы из локального
 официального PDF. Импортёр хранит текст, ссылку на раздел, выпуск PDF и номер страницы.
 Повторный импорт заменяет корпус PostgreSQL 17 одной транзакцией.
 
