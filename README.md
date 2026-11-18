@@ -421,6 +421,46 @@ FROM ai.llm(
 
 `make_func(имя, описание)` сама загружает навыки из `ai.skill_binding` и возвращает их в `applied_skills`. Пустой `target_function` задаёт привязку ко всей схеме. Если один навык привязан и к схеме, и к имени функции, действует версия из привязки к функции.
 
+### Навык из сохранённого диалога
+
+Зафиксируйте в чате правило, которое нужно применять в следующих задачах. Например, диалог о таблице `billing.orders` может содержать такое подтверждение:
+
+```sql
+SELECT ai.create_conversation('Как считаем выручку') AS conversation_id \gset
+
+SELECT answer
+FROM ai.chat(
+    :'conversation_id'::uuid,
+    'Для billing.orders считаем выручку по месяцу оплаты paid_on. Суммируем amount только по оплаченным заказам.'
+);
+
+SELECT ai.draft_skill(
+    :'conversation_id'::uuid, 'billing-revenue-month', p_schema => 'billing'
+) AS draft \gset
+
+SELECT :'draft'::jsonb;
+```
+
+`ai.draft_skill` отправляет модели историю диалога, доступного его владельцу, и возвращает редактируемый JSON. При указании `p_schema` функция берёт допустимые имена таблиц и представлений из снимка этой схемы. Для общего навыка без привязки к объектам вызовите её без `p_schema`. Модель использует профиль сессии или значение `p_profile`.
+
+Проверьте формулировку и SQL-примеры перед публикацией. При необходимости отредактируйте JSON и передайте исправленный вариант. Публикация оставляет предыдущие версии доступными. Для новой редакции укажите свободный `p_version`.
+
+```sql
+SELECT ai.publish_skill(:'draft'::jsonb);
+
+SELECT answer, applied_skills
+FROM ai.llm(
+    NULL, 'В какой месяц отнести заказ от 31 января, оплаченный 1 февраля?',
+    p_skills => ARRAY['billing-revenue-month@1']
+);
+
+-- Подключить точную версию к генерации одноимённого отчёта.
+INSERT INTO ai.skill_binding (target_schema, target_function, skill_name, skill_version)
+VALUES ('reporting', 'monthly_revenue', 'billing-revenue-month', 1);
+```
+
+Роли с настроенным доступом к `ai.llm` и истории нужны `EXECUTE` на `ai.draft_skill(uuid,text,text,text)` и `ai._validate_skill_draft(jsonb)`. Для черновика с `p_schema` ей также нужен `SELECT` на `ai.catalog_snapshot`. Публикующей роли нужны `EXECUTE` на `ai.publish_skill(jsonb,integer)` и тот же валидатор, а также `INSERT` на `ai.skill`.
+
 Установщик регистрирует `supabase-postgres-best-practices@1`, краткую адаптацию [рекомендаций Supabase для PostgreSQL](https://github.com/supabase/agent-skills/tree/c9be0e931b7930f7d02126d04774d904c381e7d7/skills/supabase-postgres-best-practices). `ai.make_func` передаёт её модели при генерации и ревью черновика, а `ai.review_function` — при ревью существующей функции. Привязка к схеме или функции может выбрать другую версию навыка. В чате навык выбирается явно и доступен без снимка схемы.
 
 ```sql
