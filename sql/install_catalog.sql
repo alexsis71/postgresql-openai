@@ -1331,6 +1331,7 @@ DECLARE
     v_review jsonb;
     v_attempt integer := 1;
     v_repair_feedback jsonb;
+    v_generator_prompt_sha256 text;
     v_error_detail text;
     v_task jsonb;
     v_retry jsonb;
@@ -1461,6 +1462,7 @@ $prompt$),
             E'\nHonor both the grouping and the output columns in the description. ' ||
             'If a period is named for grouping but omitted from the output list, use it in GROUP BY without selecting it.')
     );
+    v_generator_prompt_sha256 := encode(sha256(convert_to(v_messages #>> '{0,content}', 'UTF8')), 'hex');
     LOOP
         v_payload := ai._complete(v_profile, v_messages);
         v_generator_usage := v_payload->'usage';
@@ -1605,13 +1607,17 @@ $prompt$),
     ) VALUES (
         v_target_schema, v_name_parts[cardinality(v_name_parts)], p_description, signature, ddl,
         assumptions, v_profile.profile, coalesce(v_payload->>'model', v_profile.model),
-        encode(sha256(convert_to(v_messages #>> '{0,content}', 'UTF8')), 'hex'),
+        v_generator_prompt_sha256,
         encode(sha256(convert_to(v_catalog::text, 'UTF8')), 'hex'), applied_skills, v_review, v_report_contract,
         jsonb_build_object('mode', v_catalog_mode, 'full_bytes', v_full_catalog_bytes,
             'selected_bytes', octet_length(v_catalog::text),
             'prompt_tokens', v_generator_usage->'prompt_tokens',
             'generation_attempts', v_attempt,
-            'elapsed_ms', round(extract(epoch FROM clock_timestamp() - v_generation_started) * 1000)),
+            'elapsed_ms', round(extract(epoch FROM clock_timestamp() - v_generation_started) * 1000))
+        || CASE WHEN v_attempt = 2 THEN jsonb_build_object(
+            'repair_feedback', v_repair_feedback,
+            'repair_request_sha256', encode(sha256(convert_to(v_messages::text, 'UTF8')), 'hex')
+        ) ELSE '{}'::jsonb END,
         to_jsonb(ARRAY(SELECT doc - 'excerpt' FROM jsonb_array_elements(v_documentation) AS d(doc)))
     );
     RETURN NEXT;
@@ -2116,12 +2122,17 @@ DECLARE
     v_generation ai.function_generation%ROWTYPE;
     v_name_parts text[];
     v_function_parts text[];
+    v_input_arguments text;
     v_input_types text[];
     v_joined_arguments text;
     v_schema text;
     v_name text;
     v_signature_prefix text;
-    v_argument_pattern constant text := $pattern$((?:"(?:[^"]|"")*"|\([^()]*\)|[^",()])+)$pattern$;
+    v_argument_atom constant text := $pattern$(?:"(?:[^"]|"")*"|\([^()]*\)|[^",()])$pattern$;
+    v_argument_pattern constant text := '(' || v_argument_atom || '+)';
+    v_saved_pattern constant text :=
+        '^((?:' || v_argument_atom || '+(?:,' || v_argument_atom || '+)*)?)\) RETURNS ';
+    v_whitespace constant text := E' \t\r\n\f\013';
 BEGIN
     IF nullif(v_input, '') IS NULL THEN
         RAISE EXCEPTION 'Provide a function signature or view name';
@@ -2146,14 +2157,16 @@ BEGIN
             v_schema := v_name_parts[1];
             v_name := v_name_parts[2];
             v_signature_prefix := format('%I.%I(', v_schema, v_name);
+            v_input_arguments := btrim(v_function_parts[2], v_whitespace);
 
             -- Normalize aliases using the type catalog. The function itself need not exist.
-            SELECT coalesce(array_agg(coalesce(to_regtype(btrim(arg[1]))::text, btrim(arg[1])) ORDER BY pos), '{}'),
+            SELECT coalesce(array_agg(coalesce(to_regtype(nullif(t.type_name, ''))::text, t.type_name) ORDER BY pos), '{}'),
                    coalesce(string_agg(arg[1], ',' ORDER BY pos), '')
             INTO v_input_types, v_joined_arguments
-            FROM regexp_matches(btrim(v_function_parts[2]), v_argument_pattern, 'g')
-                WITH ORDINALITY AS a(arg, pos);
-            IF v_joined_arguments <> btrim(v_function_parts[2]) THEN
+            FROM regexp_matches(v_input_arguments, v_argument_pattern, 'g')
+                WITH ORDINALITY AS a(arg, pos)
+            CROSS JOIN LATERAL (SELECT btrim(arg[1], v_whitespace) AS type_name) AS t;
+            IF v_joined_arguments <> v_input_arguments OR '' = ANY (v_input_types) THEN
                 RAISE EXCEPTION 'Provide comma-separated function input types';
             END IF;
 
@@ -2161,11 +2174,12 @@ BEGIN
             FROM ai.function_generation AS g
             CROSS JOIN LATERAL regexp_match(
                 substr(g.signature, length(v_signature_prefix) + 1),
-                $pattern$^((?:"(?:[^"]|"")*"|[^"()])*)\) RETURNS $pattern$
+                v_saved_pattern
             ) AS saved(arguments)
             WHERE g.target_schema = v_schema AND g.function_name = v_name
               AND g.object_kind = 'function'
               AND starts_with(g.signature, v_signature_prefix)
+              AND saved.arguments IS NOT NULL
               AND v_input_types = ARRAY(
                   SELECT coalesce(to_regtype(t.type_name)::text, t.type_name)
                   FROM regexp_matches(saved.arguments[1], v_argument_pattern, 'g')
